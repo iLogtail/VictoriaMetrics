@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strconv"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 )
 
@@ -16,14 +15,12 @@ import (
 //
 // This has been copied from Prometheus sources at util/strutil/strconv.go
 func SanitizeLabelName(name string) string {
-	return labelNamesSanitizer.Transform(name)
+	return invalidLabelCharRE.ReplaceAllString(name, "_")
 }
 
-var labelNamesSanitizer = bytesutil.NewFastStringTransformer(func(s string) string {
-	return invalidLabelCharRE.ReplaceAllString(s, "_")
-})
-
-var invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+var (
+	invalidLabelCharRE = regexp.MustCompile(`[^a-zA-Z0-9_]`)
+)
 
 // JoinHostPort returns host:port.
 //
@@ -35,16 +32,6 @@ func JoinHostPort(host string, port int) string {
 
 // SortedLabels represents sorted labels.
 type SortedLabels []prompbmarshal.Label
-
-// GetByName returns the label with the given name from sls.
-func (sls *SortedLabels) GetByName(name string) string {
-	for _, lb := range *sls {
-		if lb.Name == name {
-			return lb.Value
-		}
-	}
-	return ""
-}
 
 // UnmarshalJSON unmarshals JSON from data.
 func (sls *SortedLabels) UnmarshalJSON(data []byte) error {

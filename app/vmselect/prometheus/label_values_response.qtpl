@@ -1,12 +1,7 @@
 {% stripspace %}
-
-{% import (
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
-) %}
-
 LabelValuesResponse generates response for /api/v1/label/<labelName>/values .
 See https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-values
-{% func LabelValuesResponse(labelValues []string, qt *querytracer.Tracer) %}
+{% func LabelValuesResponse(labelValues []string) %}
 {
 	"status":"success",
 	"data":[
@@ -15,11 +10,6 @@ See https://prometheus.io/docs/prometheus/latest/querying/api/#querying-label-va
 			{% if i+1 < len(labelValues) %},{% endif %}
 		{% endfor %}
 	]
-	{% code
-		qt.Printf("generate response for %d label values", len(labelValues))
-		qt.Done()
-	%}
-	{%= dumpQueryTrace(qt) %}
 }
 {% endfunc %}
 {% endstripspace %}

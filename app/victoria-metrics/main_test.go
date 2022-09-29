@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -307,7 +308,7 @@ func readIn(readFor string, t *testing.T, insertTime time.Time) []test {
 		if filepath.Ext(path) != ".json" {
 			return nil
 		}
-		b, err := os.ReadFile(path)
+		b, err := ioutil.ReadFile(path)
 		s.noError(err)
 		item := test{}
 		s.noError(json.Unmarshal(b, &item))

@@ -24,8 +24,10 @@ var (
 		"For example: America/New_York, Europe/Berlin, Etc/GMT+3 or Local")
 	disableTimestamps = flag.Bool("loggerDisableTimestamps", false, "Whether to disable writing timestamps in logs")
 
-	errorsPerSecondLimit = flag.Int("loggerErrorsPerSecondLimit", 0, `Per-second limit on the number of ERROR messages. If more than the given number of errors are emitted per second, the remaining errors are suppressed. Zero values disable the rate limit`)
-	warnsPerSecondLimit  = flag.Int("loggerWarnsPerSecondLimit", 0, `Per-second limit on the number of WARN messages. If more than the given number of warns are emitted per second, then the remaining warns are suppressed. Zero values disable the rate limit`)
+	errorsPerSecondLimit = flag.Int("loggerErrorsPerSecondLimit", 0, "Per-second limit on the number of ERROR messages. If more than the given number of errors "+
+		"are emitted per second, then the remaining errors are suppressed. Zero value disables the rate limit")
+	warnsPerSecondLimit = flag.Int("loggerWarnsPerSecondLimit", 0, "Per-second limit on the number of WARN messages. If more than the given number of warns "+
+		"are emitted per second, then the remaining warns are suppressed. Zero value disables the rate limit")
 )
 
 // Init initializes the logger.
@@ -40,6 +42,7 @@ func Init() {
 	initTimezone()
 	go logLimiterCleaner()
 	logAllFlags()
+
 }
 
 func initTimezone() {
@@ -78,7 +81,7 @@ func validateLoggerFormat() {
 	switch *loggerFormat {
 	case "default", "json":
 	default:
-		// We cannot use logger.Panicf here, since the logger isn't initialized yet.
+		// We cannot use logger.Pancif here, since the logger isn't initialized yet.
 		panic(fmt.Errorf("FATAL: unsupported `-loggerFormat` value: %q; supported values are: default, json", *loggerFormat))
 	}
 }

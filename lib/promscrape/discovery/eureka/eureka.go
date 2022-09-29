@@ -2,28 +2,23 @@ package eureka
 
 import (
 	"encoding/xml"
-	"flag"
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
 
-// SDCheckInterval defines interval for targets refresh.
-var SDCheckInterval = flag.Duration("promscrape.eurekaSDCheckInterval", 30*time.Second, "Interval for checking for changes in eureka. "+
-	"This works only if eureka_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://docs.victoriametrics.com/sd_configs.html#eureka_sd_configs for details")
+const appsAPIPath = "/apps"
 
 // SDConfig represents service discovery config for eureka.
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#eureka
 type SDConfig struct {
 	Server            string                     `yaml:"server,omitempty"`
-	HTTPClientConfig  promauth.HTTPClientConfig  `yaml:",inline"`
-	ProxyURL          *proxy.URL                 `yaml:"proxy_url,omitempty"`
+	HTTPClientConfig  promauth.HTTPClientConfig  `ymal:",inline"`
+	ProxyURL          proxy.URL                  `yaml:"proxy_url,omitempty"`
 	ProxyClientConfig promauth.ProxyClientConfig `yaml:",inline"`
 	// RefreshInterval time.Duration `yaml:"refresh_interval"`
 	// refresh_interval is obtained from `-promscrape.ec2SDCheckInterval` command-line option.
@@ -87,7 +82,7 @@ func (sdc *SDConfig) GetLabels(baseDir string) ([]map[string]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cannot get API config: %w", err)
 	}
-	data, err := getAPIResponse(cfg, "/apps")
+	data, err := getAPIResponse(cfg, appsAPIPath)
 	if err != nil {
 		return nil, err
 	}
@@ -139,11 +134,11 @@ func addInstanceLabels(apps *applications) []map[string]string {
 			if len(instance.DataCenterInfo.Name) > 0 {
 				m["__meta_eureka_app_instance_datacenterinfo_name"] = instance.DataCenterInfo.Name
 				for _, tag := range instance.DataCenterInfo.Metadata.Items {
-					m[discoveryutils.SanitizeLabelName("__meta_eureka_app_instance_datacenterinfo_metadata_"+tag.XMLName.Local)] = tag.Content
+					m["__meta_eureka_app_instance_datacenterinfo_metadata_"+discoveryutils.SanitizeLabelName(tag.XMLName.Local)] = tag.Content
 				}
 			}
 			for _, tag := range instance.Metadata.Items {
-				m[discoveryutils.SanitizeLabelName("__meta_eureka_app_instance_metadata_"+tag.XMLName.Local)] = tag.Content
+				m["__meta_eureka_app_instance_metadata_"+discoveryutils.SanitizeLabelName(tag.XMLName.Local)] = tag.Content
 			}
 			ms = append(ms, m)
 		}

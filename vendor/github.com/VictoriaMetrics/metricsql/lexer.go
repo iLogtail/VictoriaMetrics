@@ -83,7 +83,7 @@ again:
 		}
 		lex.sTail = s[n+1:]
 		goto again
-	case '{', '}', '[', ']', '(', ')', ',', '@':
+	case '{', '}', '[', ']', '(', ')', ',':
 		token = s[:1]
 		goto tokenFoundLabel
 	}
@@ -134,7 +134,7 @@ func scanString(s string) (string, error) {
 	for {
 		n := strings.IndexByte(s[i:], quote)
 		if n < 0 {
-			return "", fmt.Errorf("cannot find closing quote %c for the string %q", quote, s)
+			return "", fmt.Errorf("cannot find closing quote %ch for the string %q", quote, s)
 		}
 		i += n
 		bs := 0
@@ -445,12 +445,7 @@ func DurationValue(s string, step int64) (int64, error) {
 	if len(s) == 0 {
 		return 0, fmt.Errorf("duration cannot be empty")
 	}
-	// Try parsing floating-point duration
-	d, err := strconv.ParseFloat(s, 64)
-	if err == nil {
-		// Convert the duration to milliseconds.
-		return int64(d * 1000), nil
-	}
+	var d float64
 	isMinus := false
 	for len(s) > 0 {
 		n := scanSingleDuration(s, true)

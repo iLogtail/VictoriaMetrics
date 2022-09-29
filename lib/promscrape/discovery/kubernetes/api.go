@@ -9,46 +9,22 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 )
 
+// apiConfig contains config for API server
+type apiConfig struct {
+	aw *apiWatcher
+}
+
 func newAPIConfig(sdc *SDConfig, baseDir string, swcFunc ScrapeWorkConstructorFunc) (*apiConfig, error) {
-	role := sdc.role()
-	switch role {
-	case "node", "pod", "service", "endpoints", "endpointslice", "ingress":
+	switch sdc.Role {
+	case "node", "pod", "service", "endpoints", "endpointslices", "ingress":
 	default:
-		return nil, fmt.Errorf("unexpected `role`: %q; must be one of `node`, `pod`, `service`, `endpoints`, `endpointslice` or `ingress`", role)
+		return nil, fmt.Errorf("unexpected `role`: %q; must be one of `node`, `pod`, `service`, `endpoints`, `endpointslices` or `ingress`", sdc.Role)
 	}
-	cc := &sdc.HTTPClientConfig
-	ac, err := cc.NewConfig(baseDir)
+	ac, err := sdc.HTTPClientConfig.NewConfig(baseDir)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse auth config: %w", err)
 	}
 	apiServer := sdc.APIServer
-
-	if len(sdc.KubeConfigFile) > 0 {
-		if len(apiServer) > 0 {
-			return nil, fmt.Errorf("`api_server: %q` and `kubeconfig_file: %q` options cannot be set simultaneously", apiServer, sdc.KubeConfigFile)
-		}
-		kc, err := newKubeConfig(sdc.KubeConfigFile)
-		if err != nil {
-			return nil, fmt.Errorf("cannot build kube config from the specified `kubeconfig_file` config option: %w", err)
-		}
-		opts := &promauth.Options{
-			BaseDir:         baseDir,
-			BasicAuth:       kc.basicAuth,
-			BearerToken:     kc.token,
-			BearerTokenFile: kc.tokenFile,
-			OAuth2:          cc.OAuth2,
-			TLSConfig:       kc.tlsConfig,
-			Headers:         cc.Headers,
-		}
-		acNew, err := opts.NewConfig()
-		if err != nil {
-			return nil, fmt.Errorf("cannot initialize auth config from `kubeconfig_file: %q`: %w", sdc.KubeConfigFile, err)
-		}
-		ac = acNew
-		apiServer = kc.server
-		sdc.ProxyURL = kc.proxyURL
-	}
-
 	if len(apiServer) == 0 {
 		// Assume we run at k8s pod.
 		// Discover apiServer and auth config according to k8s docs.
@@ -67,14 +43,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string, swcFunc ScrapeWorkConstructorFu
 		tlsConfig := promauth.TLSConfig{
 			CAFile: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
 		}
-		opts := &promauth.Options{
-			BaseDir:         baseDir,
-			BearerTokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
-			OAuth2:          cc.OAuth2,
-			TLSConfig:       &tlsConfig,
-			Headers:         cc.Headers,
-		}
-		acNew, err := opts.NewConfig()
+		acNew, err := promauth.NewConfig(".", nil, nil, "", "/var/run/secrets/kubernetes.io/serviceaccount/token", &tlsConfig)
 		if err != nil {
 			return nil, fmt.Errorf("cannot initialize service account auth: %w; probably, `kubernetes_sd_config->api_server` is missing in Prometheus configs?", err)
 		}

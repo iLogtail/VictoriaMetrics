@@ -3,22 +3,20 @@ package main
 import (
 	"context"
 	"math/rand"
+	"net/url"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/remotewrite"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 )
 
 func TestMain(m *testing.M) {
-	if err := templates.Load([]string{"testdata/templates/*good.tmpl"}, true); err != nil {
-		os.Exit(1)
-	}
+	u, _ := url.Parse("https://victoriametrics.com/path")
+	notifier.InitTemplateFunc(u)
 	os.Exit(m.Run())
 }
 
@@ -27,9 +25,10 @@ func TestMain(m *testing.M) {
 // starting with empty rules folder
 func TestManagerEmptyRulesDir(t *testing.T) {
 	m := &manager{groups: make(map[uint64]*Group)}
-	cfg := loadCfg(t, []string{"foo/bar"}, true, true)
-	if err := m.update(context.Background(), cfg, false); err != nil {
-		t.Fatalf("expected to load successfully with empty rules dir; got err instead: %v", err)
+	path := []string{"foo/bar"}
+	err := m.update(context.Background(), path, true, true, false)
+	if err != nil {
+		t.Fatalf("expected to load succesfully with empty rules dir; got err instead: %v", err)
 	}
 }
 
@@ -38,24 +37,21 @@ func TestManagerEmptyRulesDir(t *testing.T) {
 // Should be executed with -race flag
 func TestManagerUpdateConcurrent(t *testing.T) {
 	m := &manager{
-		groups:         make(map[uint64]*Group),
-		querierBuilder: &fakeQuerier{},
-		notifiers:      func() []notifier.Notifier { return []notifier.Notifier{&fakeNotifier{}} },
+		groups:    make(map[uint64]*Group),
+		querier:   &fakeQuerier{},
+		notifiers: []notifier.Notifier{&fakeNotifier{}},
 	}
 	paths := []string{
 		"config/testdata/dir/rules0-good.rules",
 		"config/testdata/dir/rules0-bad.rules",
 		"config/testdata/dir/rules1-good.rules",
 		"config/testdata/dir/rules1-bad.rules",
-		"config/testdata/rules/rules0-good.rules",
-		"config/testdata/rules/rules1-good.rules",
-		"config/testdata/rules/rules2-good.rules",
+		"config/testdata/rules0-good.rules",
+		"config/testdata/rules1-good.rules",
+		"config/testdata/rules2-good.rules",
 	}
-	evalInterval := *evaluationInterval
-	defer func() { *evaluationInterval = evalInterval }()
 	*evaluationInterval = time.Millisecond
-	cfg := loadCfg(t, []string{paths[0]}, true, true)
-	if err := m.start(context.Background(), cfg); err != nil {
+	if err := m.start(context.Background(), []string{paths[0]}, true, true); err != nil {
 		t.Fatalf("failed to start: %s", err)
 	}
 
@@ -68,11 +64,8 @@ func TestManagerUpdateConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
 				rnd := rand.Intn(len(paths))
-				cfg, err := config.Parse([]string{paths[rnd]}, notifier.ValidateTemplates, true)
-				if err != nil { // update can fail and this is expected
-					continue
-				}
-				_ = m.update(context.Background(), cfg, false)
+				path := []string{paths[rnd]}
+				_ = m.update(context.Background(), path, true, true, false)
 			}
 		}()
 	}
@@ -115,6 +108,18 @@ func TestManagerUpdate(t *testing.T) {
 			Name: "ExampleAlertAlwaysFiring",
 			Expr: "sum by(job) (up == 1)",
 		}
+		ExampleAlertGraphite = &AlertingRule{
+			Name: "up graphite",
+			Expr: "filterSeries(time('host.1',20),'>','0')",
+			Type: datasource.NewGraphiteType(),
+			For:  defaultEvalInterval,
+		}
+		ExampleAlertGraphite2 = &AlertingRule{
+			Name: "up",
+			Expr: "filterSeries(time('host.2',20),'>','0')",
+			Type: datasource.NewGraphiteType(),
+			For:  defaultEvalInterval,
+		}
 	)
 
 	testCases := []struct {
@@ -125,20 +130,20 @@ func TestManagerUpdate(t *testing.T) {
 	}{
 		{
 			name:       "update good rules",
-			initPath:   "config/testdata/rules/rules0-good.rules",
+			initPath:   "config/testdata/rules0-good.rules",
 			updatePath: "config/testdata/dir/rules1-good.rules",
 			want: []*Group{
 				{
 					File:     "config/testdata/dir/rules1-good.rules",
 					Name:     "duplicatedGroupDiffFiles",
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Interval: defaultEvalInterval,
 					Rules: []Rule{
 						&AlertingRule{
 							Name:   "VMRows",
 							Expr:   "vm_rows > 0",
 							For:    5 * time.Minute,
-							Labels: map[string]string{"dc": "gcp", "label": "bar"},
+							Labels: map[string]string{"label": "bar"},
 							Annotations: map[string]string{
 								"summary":     "{{ $value }}",
 								"description": "{{$labels}}",
@@ -150,20 +155,20 @@ func TestManagerUpdate(t *testing.T) {
 		},
 		{
 			name:       "update good rules from 1 to 2 groups",
-			initPath:   "config/testdata/dir/rules/rules1-good.rules",
-			updatePath: "config/testdata/rules/rules0-good.rules",
+			initPath:   "config/testdata/dir/rules1-good.rules",
+			updatePath: "config/testdata/rules0-good.rules",
 			want: []*Group{
 				{
-					File:     "config/testdata/rules/rules0-good.rules",
+					File:     "config/testdata/rules0-good.rules",
 					Name:     "groupGorSingleAlert",
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Rules:    []Rule{VMRows},
 					Interval: defaultEvalInterval,
 				},
 				{
-					File:     "config/testdata/rules/rules0-good.rules",
+					File:     "config/testdata/rules0-good.rules",
 					Interval: defaultEvalInterval,
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Name:     "TestGroup", Rules: []Rule{
 						Conns,
 						ExampleAlertAlwaysFiring,
@@ -172,21 +177,21 @@ func TestManagerUpdate(t *testing.T) {
 		},
 		{
 			name:       "update with one bad rule file",
-			initPath:   "config/testdata/rules/rules0-good.rules",
+			initPath:   "config/testdata/rules0-good.rules",
 			updatePath: "config/testdata/dir/rules2-bad.rules",
 			want: []*Group{
 				{
-					File:     "config/testdata/rules/rules0-good.rules",
+					File:     "config/testdata/rules0-good.rules",
 					Name:     "groupGorSingleAlert",
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Interval: defaultEvalInterval,
 					Rules:    []Rule{VMRows},
 				},
 				{
-					File:     "config/testdata/rules/rules0-good.rules",
+					File:     "config/testdata/rules0-good.rules",
 					Interval: defaultEvalInterval,
 					Name:     "TestGroup",
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Rules: []Rule{
 						Conns,
 						ExampleAlertAlwaysFiring,
@@ -196,22 +201,39 @@ func TestManagerUpdate(t *testing.T) {
 		{
 			name:       "update empty dir rules from 0 to 2 groups",
 			initPath:   "config/testdata/empty/*",
-			updatePath: "config/testdata/rules/rules0-good.rules",
+			updatePath: "config/testdata/rules0-good.rules",
 			want: []*Group{
 				{
-					File:     "config/testdata/rules/rules0-good.rules",
+					File:     "config/testdata/rules0-good.rules",
 					Name:     "groupGorSingleAlert",
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Interval: defaultEvalInterval,
 					Rules:    []Rule{VMRows},
 				},
 				{
-					File:     "config/testdata/rules/rules0-good.rules",
+					File:     "config/testdata/rules0-good.rules",
 					Interval: defaultEvalInterval,
-					Type:     config.NewPrometheusType(),
+					Type:     datasource.NewPrometheusType(),
 					Name:     "TestGroup", Rules: []Rule{
 						Conns,
 						ExampleAlertAlwaysFiring,
+					},
+				},
+			},
+		},
+		{
+			name:       "update prometheus to graphite type",
+			initPath:   "config/testdata/dir/rules-update0-good.rules",
+			updatePath: "config/testdata/dir/rules-update1-good.rules",
+			want: []*Group{
+				{
+					File:     "config/testdata/dir/rules-update1-good.rules",
+					Interval: defaultEvalInterval,
+					Type:     datasource.NewGraphiteType(),
+					Name:     "TestUpdateGroup",
+					Rules: []Rule{
+						ExampleAlertGraphite2,
+						ExampleAlertGraphite,
 					},
 				},
 			},
@@ -220,21 +242,14 @@ func TestManagerUpdate(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.TODO())
-			m := &manager{
-				groups:         make(map[uint64]*Group),
-				querierBuilder: &fakeQuerier{},
-				notifiers:      func() []notifier.Notifier { return []notifier.Notifier{&fakeNotifier{}} },
-			}
-
-			cfgInit := loadCfg(t, []string{tc.initPath}, true, true)
-			if err := m.update(ctx, cfgInit, false); err != nil {
+			m := &manager{groups: make(map[uint64]*Group), querier: &fakeQuerier{}}
+			path := []string{tc.initPath}
+			if err := m.update(ctx, path, true, true, false); err != nil {
 				t.Fatalf("failed to complete initial rules update: %s", err)
 			}
 
-			cfgUpdate, err := config.Parse([]string{tc.updatePath}, notifier.ValidateTemplates, true)
-			if err == nil { // update can fail and that's expected
-				_ = m.update(ctx, cfgUpdate, false)
-			}
+			path = []string{tc.updatePath}
+			_ = m.update(ctx, path, true, true, false)
 			if len(tc.want) != len(m.groups) {
 				t.Fatalf("\nwant number of groups: %d;\ngot: %d ", len(tc.want), len(m.groups))
 			}
@@ -251,91 +266,4 @@ func TestManagerUpdate(t *testing.T) {
 			m.close()
 		})
 	}
-}
-
-func TestManagerUpdateNegative(t *testing.T) {
-	testCases := []struct {
-		notifiers []notifier.Notifier
-		rw        *remotewrite.Client
-		cfg       config.Group
-		expErr    string
-	}{
-		{
-			nil,
-			nil,
-			config.Group{Name: "Recording rule only",
-				Rules: []config.Rule{
-					{Record: "record", Expr: "max(up)"},
-				},
-			},
-			"contains recording rules",
-		},
-		{
-			nil,
-			nil,
-			config.Group{Name: "Alerting rule only",
-				Rules: []config.Rule{
-					{Alert: "alert", Expr: "up > 0"},
-				},
-			},
-			"contains alerting rules",
-		},
-		{
-			[]notifier.Notifier{&fakeNotifier{}},
-			nil,
-			config.Group{Name: "Recording and alerting rules",
-				Rules: []config.Rule{
-					{Alert: "alert1", Expr: "up > 0"},
-					{Alert: "alert2", Expr: "up > 0"},
-					{Record: "record", Expr: "max(up)"},
-				},
-			},
-			"contains recording rules",
-		},
-		{
-			nil,
-			&remotewrite.Client{},
-			config.Group{Name: "Recording and alerting rules",
-				Rules: []config.Rule{
-					{Record: "record1", Expr: "max(up)"},
-					{Record: "record2", Expr: "max(up)"},
-					{Alert: "alert", Expr: "up > 0"},
-				},
-			},
-			"contains alerting rules",
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.cfg.Name, func(t *testing.T) {
-			m := &manager{
-				groups:         make(map[uint64]*Group),
-				querierBuilder: &fakeQuerier{},
-				rw:             tc.rw,
-			}
-			if tc.notifiers != nil {
-				m.notifiers = func() []notifier.Notifier { return tc.notifiers }
-			}
-			err := m.update(context.Background(), []config.Group{tc.cfg}, false)
-			if err == nil {
-				t.Fatalf("expected to get error; got nil")
-			}
-			if !strings.Contains(err.Error(), tc.expErr) {
-				t.Fatalf("expected err to contain %q; got %q", tc.expErr, err)
-			}
-		})
-	}
-}
-
-func loadCfg(t *testing.T, path []string, validateAnnotations, validateExpressions bool) []config.Group {
-	t.Helper()
-	var validateTplFn config.ValidateTplFn
-	if validateAnnotations {
-		validateTplFn = notifier.ValidateTemplates
-	}
-	cfg, err := config.Parse(path, validateTplFn, validateExpressions)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cfg
 }

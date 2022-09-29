@@ -1,47 +1,38 @@
 package cgroup
 
 import (
-	"fmt"
+	"io/ioutil"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
-
-	"github.com/VictoriaMetrics/metrics"
+	"sync"
 )
 
 // AvailableCPUs returns the number of available CPU cores for the app.
-//
-// The number is rounded to the next integer value if fractional number of CPU cores are available.
 func AvailableCPUs() int {
+	availableCPUsOnce.Do(updateGOMAXPROCSToCPUQuota)
 	return runtime.GOMAXPROCS(-1)
 }
 
-func init() {
-	cpuQuota := getCPUQuota()
-	if cpuQuota > 0 {
-		updateGOMAXPROCSToCPUQuota(cpuQuota)
-	}
-	cpuCoresAvailable := cpuQuota
-	if cpuCoresAvailable <= 0 {
-		cpuCoresAvailable = float64(runtime.NumCPU())
-	}
-	metrics.NewGauge(`process_cpu_cores_available`, func() float64 {
-		return cpuCoresAvailable
-	})
-}
+var availableCPUsOnce sync.Once
 
-// updateGOMAXPROCSToCPUQuota updates GOMAXPROCS to cpuQuota if GOMAXPROCS isn't set in environment var.
-func updateGOMAXPROCSToCPUQuota(cpuQuota float64) {
+// updateGOMAXPROCSToCPUQuota updates GOMAXPROCS to cgroup CPU quota if GOMAXPROCS isn't set in environment var.
+func updateGOMAXPROCSToCPUQuota() {
 	if v := os.Getenv("GOMAXPROCS"); v != "" {
 		// Do not override explicitly set GOMAXPROCS.
 		return
 	}
-	gomaxprocs := int(cpuQuota + 0.5)
+	q := getCPUQuota()
+	if q <= 0 {
+		// Do not change GOMAXPROCS
+		return
+	}
+	gomaxprocs := int(q + 0.5)
 	numCPU := runtime.NumCPU()
 	if gomaxprocs > numCPU {
 		// There is no sense in setting more GOMAXPROCS than the number of available CPU cores.
-		gomaxprocs = numCPU
+		return
 	}
 	if gomaxprocs <= 0 {
 		gomaxprocs = 1
@@ -50,27 +41,20 @@ func updateGOMAXPROCSToCPUQuota(cpuQuota float64) {
 }
 
 func getCPUQuota() float64 {
-	cpuQuota, err := getCPUQuotaGeneric()
+	quotaUS, err := getCPUStat("cpu.cfs_quota_us")
 	if err != nil {
 		return 0
 	}
-	if cpuQuota <= 0 {
+	if quotaUS <= 0 {
 		// The quota isn't set. This may be the case in multilevel containers.
 		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/685#issuecomment-674423728
 		return getOnlineCPUCount()
 	}
-	return cpuQuota
-}
-
-func getCPUQuotaGeneric() (float64, error) {
-	quotaUS, err := getCPUStat("cpu.cfs_quota_us")
-	if err == nil {
-		periodUS, err := getCPUStat("cpu.cfs_period_us")
-		if err == nil {
-			return float64(quotaUS) / float64(periodUS), nil
-		}
+	periodUS, err := getCPUStat("cpu.cfs_period_us")
+	if err != nil {
+		return 0
 	}
-	return getCPUQuotaV2("/sys/fs/cgroup", "/proc/self/cgroup")
+	return float64(quotaUS) / float64(periodUS)
 }
 
 func getCPUStat(statName string) (int64, error) {
@@ -79,7 +63,7 @@ func getCPUStat(statName string) (int64, error) {
 
 func getOnlineCPUCount() float64 {
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/685#issuecomment-674423728
-	data, err := os.ReadFile("/sys/devices/system/cpu/online")
+	data, err := ioutil.ReadFile("/sys/devices/system/cpu/online")
 	if err != nil {
 		return -1
 	}
@@ -88,39 +72,6 @@ func getOnlineCPUCount() float64 {
 		return -1
 	}
 	return n
-}
-
-func getCPUQuotaV2(sysPrefix, cgroupPath string) (float64, error) {
-	data, err := getFileContents("cpu.max", sysPrefix, cgroupPath, "")
-	if err != nil {
-		return 0, err
-	}
-	data = strings.TrimSpace(data)
-	n, err := parseCPUMax(data)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse cpu.max file contents: %w", err)
-	}
-	return n, nil
-}
-
-// See https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html#cpu
-func parseCPUMax(data string) (float64, error) {
-	bounds := strings.Split(data, " ")
-	if len(bounds) != 2 {
-		return 0, fmt.Errorf("unexpected line format: want 'quota period'; got: %s", data)
-	}
-	if bounds[0] == "max" {
-		return -1, nil
-	}
-	quota, err := strconv.ParseUint(bounds[0], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse quota: %w", err)
-	}
-	period, err := strconv.ParseUint(bounds[1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse period: %w", err)
-	}
-	return float64(quota) / float64(period), nil
 }
 
 func countCPUs(data string) int {

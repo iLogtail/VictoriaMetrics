@@ -1,16 +1,11 @@
 package storage
 
 import (
-	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 // partHeader represents part header.
@@ -26,9 +21,6 @@ type partHeader struct {
 
 	// MaxTimestamp is the maximum timestamp in the part.
 	MaxTimestamp int64
-
-	// MinDedupInterval is minimal dedup interval in milliseconds across all the blocks in the part.
-	MinDedupInterval int64
 }
 
 // String returns string representation of ph.
@@ -112,10 +104,6 @@ func (ph *partHeader) ParseFromPath(path string) error {
 		return fmt.Errorf("blocksCount cannot be bigger than rowsCount; got blocksCount=%d, rowsCount=%d", ph.BlocksCount, ph.RowsCount)
 	}
 
-	if err := ph.readMinDedupInterval(path); err != nil {
-		return fmt.Errorf("cannot read min dedup interval: %w", err)
-	}
-
 	return nil
 }
 
@@ -125,34 +113,4 @@ func (ph *partHeader) Reset() {
 	ph.BlocksCount = 0
 	ph.MinTimestamp = (1 << 63) - 1
 	ph.MaxTimestamp = -1 << 63
-	ph.MinDedupInterval = 0
-}
-
-func (ph *partHeader) readMinDedupInterval(partPath string) error {
-	filePath := partPath + "/min_dedup_interval"
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			// The minimum dedup interval may not exist for old parts.
-			ph.MinDedupInterval = 0
-			return nil
-		}
-		return fmt.Errorf("cannot read %q: %w", filePath, err)
-	}
-	dedupInterval, err := promutils.ParseDuration(string(data))
-	if err != nil {
-		return fmt.Errorf("cannot parse minimum dedup interval %q at %q: %w", data, filePath, err)
-	}
-	ph.MinDedupInterval = dedupInterval.Milliseconds()
-	return nil
-}
-
-func (ph *partHeader) writeMinDedupInterval(partPath string) error {
-	filePath := partPath + "/min_dedup_interval"
-	dedupInterval := time.Duration(ph.MinDedupInterval) * time.Millisecond
-	data := dedupInterval.String()
-	if err := fs.WriteFileAtomically(filePath, []byte(data)); err != nil {
-		return fmt.Errorf("cannot create %q: %w", filePath, err)
-	}
-	return nil
 }

@@ -272,9 +272,7 @@ func loadBuckets(buckets []bucket, dataPath string, maxChunks uint64) error {
 }
 
 func (b *bucket) Save(w io.Writer) error {
-	b.mu.Lock()
-	b.cleanLocked()
-	b.mu.Unlock()
+	b.Clean()
 
 	b.mu.RLock()
 	defer b.mu.RUnlock()

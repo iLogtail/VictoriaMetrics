@@ -10,7 +10,7 @@ import (
 var (
 	enable = flag.Bool("envflag.enable", false, "Whether to enable reading flags from environment variables additionally to command line. "+
 		"Command line flag values have priority over values from environment vars. "+
-		"Flags are read only from command line if this flag isn't set. See https://docs.victoriametrics.com/#environment-variables for more details")
+		"Flags are read only from command line if this flag isn't set")
 	prefix = flag.String("envflag.prefix", "", "Prefix for environment variables if -envflag.enable is set")
 )
 
@@ -40,7 +40,7 @@ func Parse() {
 		// Get flag value from environment var.
 		fname := getEnvFlagName(f.Name)
 		if v, ok := os.LookupEnv(fname); ok {
-			if err := flag.Set(f.Name, v); err != nil {
+			if err := f.Value.Set(v); err != nil {
 				// Do not use lib/logger here, since it is uninitialized yet.
 				log.Fatalf("cannot set flag %s to %q, which is read from environment variable %q: %s", f.Name, v, fname, err)
 			}

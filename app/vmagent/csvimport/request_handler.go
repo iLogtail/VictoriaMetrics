@@ -5,35 +5,32 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/csvimport"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/tenantmetrics"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	rowsInserted       = metrics.NewCounter(`vmagent_rows_inserted_total{type="csvimport"}`)
-	rowsTenantInserted = tenantmetrics.NewCounterMap(`vmagent_tenant_inserted_rows_total{type="csvimport"}`)
-	rowsPerInsert      = metrics.NewHistogram(`vmagent_rows_per_insert{type="csvimport"}`)
+	rowsInserted  = metrics.NewCounter(`vmagent_rows_inserted_total{type="csvimport"}`)
+	rowsPerInsert = metrics.NewHistogram(`vmagent_rows_per_insert{type="csvimport"}`)
 )
 
 // InsertHandler processes csv data from req.
-func InsertHandler(at *auth.Token, req *http.Request) error {
+func InsertHandler(req *http.Request) error {
 	extraLabels, err := parserCommon.GetExtraLabels(req)
 	if err != nil {
 		return err
 	}
 	return writeconcurrencylimiter.Do(func() error {
 		return parser.ParseStream(req, func(rows []parser.Row) error {
-			return insertRows(at, rows, extraLabels)
+			return insertRows(rows, extraLabels)
 		})
 	})
 }
 
-func insertRows(at *auth.Token, rows []parser.Row, extraLabels []prompbmarshal.Label) error {
+func insertRows(rows []parser.Row, extraLabels []prompbmarshal.Label) error {
 	ctx := common.GetPushCtx()
 	defer common.PutPushCtx(ctx)
 
@@ -67,11 +64,8 @@ func insertRows(at *auth.Token, rows []parser.Row, extraLabels []prompbmarshal.L
 	ctx.WriteRequest.Timeseries = tssDst
 	ctx.Labels = labels
 	ctx.Samples = samples
-	remotewrite.Push(at, &ctx.WriteRequest)
+	remotewrite.Push(&ctx.WriteRequest)
 	rowsInserted.Add(len(rows))
-	if at != nil {
-		rowsTenantInserted.Get(at).Add(len(rows))
-	}
 	rowsPerInsert.Update(float64(len(rows)))
 	return nil
 }

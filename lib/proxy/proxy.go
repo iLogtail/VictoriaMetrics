@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -20,75 +19,57 @@ import (
 
 // URL implements YAML.Marshaler and yaml.Unmarshaler interfaces for url.URL.
 type URL struct {
-	URL *url.URL
+	url *url.URL
 }
 
 // MustNewURL returns new URL for the given u.
-func MustNewURL(u string) *URL {
+func MustNewURL(u string) URL {
 	pu, err := url.Parse(u)
 	if err != nil {
 		logger.Panicf("BUG: cannot parse u=%q: %s", u, err)
 	}
-	return &URL{
-		URL: pu,
+	return URL{
+		url: pu,
 	}
 }
 
-// GetURL return the underlying url.
-func (u *URL) GetURL() *url.URL {
-	if u == nil || u.URL == nil {
+// URL return the underlying url.
+func (u *URL) URL() *url.URL {
+	if u == nil || u.url == nil {
 		return nil
 	}
-	return u.URL
+	return u.url
 }
 
 // IsHTTPOrHTTPS returns true if u is http or https
 func (u *URL) IsHTTPOrHTTPS() bool {
-	pu := u.GetURL()
+	pu := u.URL()
 	if pu == nil {
 		return false
 	}
-	scheme := u.URL.Scheme
+	scheme := u.url.Scheme
 	return scheme == "http" || scheme == "https"
 }
 
 // String returns string representation of u.
 func (u *URL) String() string {
-	pu := u.GetURL()
+	pu := u.URL()
 	if pu == nil {
 		return ""
 	}
 	return pu.String()
 }
 
-// SetHeaders sets headers to req according to u and ac configs.
-func (u *URL) SetHeaders(ac *promauth.Config, req *http.Request) {
-	ah := u.getAuthHeader(ac)
-	if ah != "" {
-		req.Header.Set("Proxy-Authorization", ah)
-	}
-	ac.SetHeaders(req, false)
-}
-
-// SetFasthttpHeaders sets headers to req according to u and ac configs.
-func (u *URL) SetFasthttpHeaders(ac *promauth.Config, req *fasthttp.Request) {
-	ah := u.getAuthHeader(ac)
-	if ah != "" {
-		req.Header.Set("Proxy-Authorization", ah)
-	}
-	ac.SetFasthttpHeaders(req, false)
-}
-
-// getAuthHeader returns Proxy-Authorization auth header for the given u and ac.
-func (u *URL) getAuthHeader(ac *promauth.Config) string {
+// GetAuthHeader returns Proxy-Authorization auth header for the given u and ac.
+func (u *URL) GetAuthHeader(ac *promauth.Config) string {
 	authHeader := ""
 	if ac != nil {
-		authHeader = ac.GetAuthHeader()
+		authHeader = ac.Authorization
 	}
-	if u == nil || u.URL == nil {
+	if u == nil || u.url == nil {
 		return authHeader
 	}
-	pu := u.URL
+	pu := u.url
 	if pu.User != nil && len(pu.User.Username()) > 0 {
 		userPasswordEncoded := base64.StdEncoding.EncodeToString([]byte(pu.User.String()))
 		authHeader = "Basic " + userPasswordEncoded
@@ -98,10 +79,10 @@ func (u *URL) getAuthHeader(ac *promauth.Config) string {
 
 // MarshalYAML implements yaml.Marshaler interface.
 func (u *URL) MarshalYAML() (interface{}, error) {
-	if u.URL == nil {
+	if u.url == nil {
 		return nil, nil
 	}
-	return u.URL.String(), nil
+	return u.url.String(), nil
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler interface.
@@ -114,16 +95,16 @@ func (u *URL) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	if err != nil {
 		return fmt.Errorf("cannot parse proxy_url=%q as *url.URL: %w", s, err)
 	}
-	u.URL = parsedURL
+	u.url = parsedURL
 	return nil
 }
 
 // NewDialFunc returns dial func for the given u and ac.
 func (u *URL) NewDialFunc(ac *promauth.Config) (fasthttp.DialFunc, error) {
-	if u == nil || u.URL == nil {
+	if u == nil || u.url == nil {
 		return defaultDialFunc, nil
 	}
-	pu := u.URL
+	pu := u.url
 	switch pu.Scheme {
 	case "http", "https", "socks5", "tls+socks5":
 	default:
@@ -141,6 +122,10 @@ func (u *URL) NewDialFunc(ac *promauth.Config) (fasthttp.DialFunc, error) {
 	if pu.Scheme == "socks5" || pu.Scheme == "tls+socks5" {
 		return socks5DialFunc(proxyAddr, pu, tlsCfg)
 	}
+	authHeader := u.GetAuthHeader(ac)
+	if authHeader != "" {
+		authHeader = "Proxy-Authorization: " + authHeader + "\r\n"
+	}
 	dialFunc := func(addr string) (net.Conn, error) {
 		proxyConn, err := defaultDialFunc(proxyAddr)
 		if err != nil {
@@ -148,11 +133,6 @@ func (u *URL) NewDialFunc(ac *promauth.Config) (fasthttp.DialFunc, error) {
 		}
 		if isTLS {
 			proxyConn = tls.Client(proxyConn, tlsCfg)
-		}
-		authHeader := u.getAuthHeader(ac)
-		if authHeader != "" {
-			authHeader = "Proxy-Authorization: " + authHeader + "\r\n"
-			authHeader += ac.HeadersNoAuthString()
 		}
 		conn, err := sendConnectRequest(proxyConn, proxyAddr, addr, authHeader)
 		if err != nil {

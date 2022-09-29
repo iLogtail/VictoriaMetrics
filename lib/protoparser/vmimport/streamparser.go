@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net/http"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
@@ -18,11 +19,12 @@ var maxLineLen = flagutil.NewBytes("import.maxLineLen", 100*1024*1024, "The maxi
 
 // ParseStream parses /api/v1/import lines from req and calls callback for the parsed rows.
 //
-// The callback can be called concurrently multiple times for streamed data from reader.
+// The callback can be called concurrently multiple times for streamed data from req.
 //
 // callback shouldn't hold rows after returning.
-func ParseStream(r io.Reader, isGzipped bool, callback func(rows []Row) error) error {
-	if isGzipped {
+func ParseStream(req *http.Request, callback func(rows []Row) error) error {
+	r := req.Body
+	if req.Header.Get("Content-Encoding") == "gzip" {
 		zr, err := common.GetGzipReader(r)
 		if err != nil {
 			return fmt.Errorf("cannot read gzipped vmimport data: %w", err)
@@ -34,8 +36,16 @@ func ParseStream(r io.Reader, isGzipped bool, callback func(rows []Row) error) e
 	defer putStreamContext(ctx)
 	for ctx.Read() {
 		uw := getUnmarshalWork()
-		uw.ctx = ctx
-		uw.callback = callback
+		uw.callback = func(rows []Row) {
+			if err := callback(rows); err != nil {
+				ctx.callbackErrLock.Lock()
+				if ctx.callbackErr == nil {
+					ctx.callbackErr = fmt.Errorf("error when processing imported data: %w", err)
+				}
+				ctx.callbackErrLock.Unlock()
+			}
+			ctx.wg.Done()
+		}
 		uw.reqBuf, ctx.reqBuf = ctx.reqBuf, uw.reqBuf
 		ctx.wg.Add(1)
 		common.ScheduleUnmarshalWork(uw)
@@ -49,7 +59,7 @@ func ParseStream(r io.Reader, isGzipped bool, callback func(rows []Row) error) e
 
 func (ctx *streamContext) Read() bool {
 	readCalls.Inc()
-	if ctx.err != nil || ctx.hasCallbackError() {
+	if ctx.err != nil {
 		return false
 	}
 	ctx.reqBuf, ctx.tailBuf, ctx.err = common.ReadLinesBlockExt(ctx.br, ctx.reqBuf, ctx.tailBuf, maxLineLen.N)
@@ -85,13 +95,6 @@ func (ctx *streamContext) Error() error {
 		return nil
 	}
 	return ctx.err
-}
-
-func (ctx *streamContext) hasCallbackError() bool {
-	ctx.callbackErrLock.Lock()
-	ok := ctx.callbackErr != nil
-	ctx.callbackErrLock.Unlock()
-	return ok
 }
 
 func (ctx *streamContext) reset() {
@@ -133,28 +136,14 @@ var streamContextPoolCh = make(chan *streamContext, cgroup.AvailableCPUs())
 
 type unmarshalWork struct {
 	rows     Rows
-	ctx      *streamContext
-	callback func(rows []Row) error
+	callback func(rows []Row)
 	reqBuf   []byte
 }
 
 func (uw *unmarshalWork) reset() {
 	uw.rows.Reset()
-	uw.ctx = nil
 	uw.callback = nil
 	uw.reqBuf = uw.reqBuf[:0]
-}
-
-func (uw *unmarshalWork) runCallback(rows []Row) {
-	ctx := uw.ctx
-	if err := uw.callback(rows); err != nil {
-		ctx.callbackErrLock.Lock()
-		if ctx.callbackErr == nil {
-			ctx.callbackErr = fmt.Errorf("error when processing imported data: %w", err)
-		}
-		ctx.callbackErrLock.Unlock()
-	}
-	ctx.wg.Done()
 }
 
 // Unmarshal implements common.UnmarshalWork
@@ -165,7 +154,7 @@ func (uw *unmarshalWork) Unmarshal() {
 		row := &rows[i]
 		rowsRead.Add(len(row.Timestamps))
 	}
-	uw.runCallback(rows)
+	uw.callback(rows)
 	putUnmarshalWork(uw)
 }
 

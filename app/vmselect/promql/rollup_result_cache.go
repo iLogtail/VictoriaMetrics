@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"flag"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,10 +11,8 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/memory"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/workingsetcache"
 	"github.com/VictoriaMetrics/fastcache"
@@ -26,18 +23,11 @@ import (
 var (
 	cacheTimestampOffset = flag.Duration("search.cacheTimestampOffset", 5*time.Minute, "The maximum duration since the current time for response data, "+
 		"which is always queried from the original raw data, without using the response cache. Increase this value if you see gaps in responses "+
-		"due to time synchronization issues between VictoriaMetrics and data sources. See also -search.disableAutoCacheReset")
-	disableAutoCacheReset = flag.Bool("search.disableAutoCacheReset", false, "Whether to disable automatic response cache reset if a sample with timestamp "+
-		"outside -search.cacheTimestampOffset is inserted into VictoriaMetrics")
+		"due to time synchronization issues between VictoriaMetrics and data sources")
 )
 
 // ResetRollupResultCacheIfNeeded resets rollup result cache if mrs contains timestamps outside `now - search.cacheTimestampOffset`.
 func ResetRollupResultCacheIfNeeded(mrs []storage.MetricRow) {
-	if *disableAutoCacheReset {
-		// Do not reset response cache if -search.disableAutoCacheReset is set.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1570 .
-		return
-	}
 	checkRollupResultCacheResetOnce.Do(func() {
 		rollupResultResetMetricRowSample.Store(&storage.MetricRow{})
 		go checkRollupResultCacheReset()
@@ -79,7 +69,7 @@ var checkRollupResultCacheResetOnce sync.Once
 var rollupResultResetMetricRowSample atomic.Value
 
 var rollupResultCacheV = &rollupResultCache{
-	c: workingsetcache.New(1024 * 1024), // This is a cache for testing.
+	c: workingsetcache.New(1024*1024, time.Hour), // This is a cache for testing.
 }
 var rollupResultCachePath string
 
@@ -100,11 +90,6 @@ var (
 )
 
 // InitRollupResultCache initializes the rollupResult cache
-//
-// if cachePath is empty, then the cache isn't stored to persistent disk.
-//
-// ResetRollupResultCache must be called when the cache must be reset.
-// StopRollupResultCache must be called when the cache isn't needed anymore.
 func InitRollupResultCache(cachePath string) {
 	rollupResultCachePath = cachePath
 	startTime := time.Now()
@@ -112,11 +97,9 @@ func InitRollupResultCache(cachePath string) {
 	var c *workingsetcache.Cache
 	if len(rollupResultCachePath) > 0 {
 		logger.Infof("loading rollupResult cache from %q...", rollupResultCachePath)
-		c = workingsetcache.Load(rollupResultCachePath, cacheSize)
-		mustLoadRollupResultCacheKeyPrefix(rollupResultCachePath)
+		c = workingsetcache.Load(rollupResultCachePath, cacheSize, time.Hour)
 	} else {
-		c = workingsetcache.New(cacheSize)
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
+		c = workingsetcache.New(cacheSize, time.Hour)
 	}
 	if *disableCache {
 		c.Reset()
@@ -143,19 +126,16 @@ func InitRollupResultCache(cachePath string) {
 			rollupResultCachePath, time.Since(startTime).Seconds(), fcs().EntriesCount, fcs().BytesSize)
 	}
 
-	// Use metrics.GetOrCreateGauge instead of metrics.NewGauge,
-	// so InitRollupResultCache+StopRollupResultCache could be called multiple times in tests.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2406
-	metrics.GetOrCreateGauge(`vm_cache_entries{type="promql/rollupResult"}`, func() float64 {
+	metrics.NewGauge(`vm_cache_entries{type="promql/rollupResult"}`, func() float64 {
 		return float64(fcs().EntriesCount)
 	})
-	metrics.GetOrCreateGauge(`vm_cache_size_bytes{type="promql/rollupResult"}`, func() float64 {
+	metrics.NewGauge(`vm_cache_size_bytes{type="promql/rollupResult"}`, func() float64 {
 		return float64(fcs().BytesSize)
 	})
-	metrics.GetOrCreateGauge(`vm_cache_requests_total{type="promql/rollupResult"}`, func() float64 {
+	metrics.NewGauge(`vm_cache_requests_total{type="promql/rollupResult"}`, func() float64 {
 		return float64(fcs().GetCalls)
 	})
-	metrics.GetOrCreateGauge(`vm_cache_misses_total{type="promql/rollupResult"}`, func() float64 {
+	metrics.NewGauge(`vm_cache_misses_total{type="promql/rollupResult"}`, func() float64 {
 		return float64(fcs().Misses)
 	})
 
@@ -174,10 +154,9 @@ func StopRollupResultCache() {
 	logger.Infof("saving rollupResult cache to %q...", rollupResultCachePath)
 	startTime := time.Now()
 	if err := rollupResultCacheV.c.Save(rollupResultCachePath); err != nil {
-		logger.Errorf("cannot save rollupResult cache at %q: %s", rollupResultCachePath, err)
+		logger.Errorf("cannot close rollupResult cache at %q: %s", rollupResultCachePath, err)
 		return
 	}
-	mustSaveRollupResultCacheKeyPrefix(rollupResultCachePath)
 	var fcs fastcache.Stats
 	rollupResultCacheV.c.UpdateStats(&fcs)
 	rollupResultCacheV.c.Stop()
@@ -199,15 +178,8 @@ func ResetRollupResultCache() {
 	logger.Infof("rollupResult cache has been cleared")
 }
 
-func (rrc *rollupResultCache) Get(qt *querytracer.Tracer, ec *EvalConfig, expr metricsql.Expr, window int64) (tss []*timeseries, newStart int64) {
-	if qt.Enabled() {
-		query := string(expr.AppendString(nil))
-		query = bytesutil.LimitStringLen(query, 300)
-		qt = qt.NewChild("rollup cache get: query=%s, timeRange=%s, step=%d, window=%d", query, ec.timeRangeString(), ec.Step, window)
-		defer qt.Done()
-	}
+func (rrc *rollupResultCache) Get(ec *EvalConfig, expr metricsql.Expr, window int64) (tss []*timeseries, newStart int64) {
 	if !ec.mayCache() {
-		qt.Printf("do not fetch series from cache, since it is disabled in the current context")
 		return nil, ec.Start
 	}
 
@@ -215,10 +187,9 @@ func (rrc *rollupResultCache) Get(qt *querytracer.Tracer, ec *EvalConfig, expr m
 	bb := bbPool.Get()
 	defer bbPool.Put(bb)
 
-	bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step, ec.EnforcedTagFilterss)
+	bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step, ec.EnforcedTagFilters)
 	metainfoBuf := rrc.c.Get(nil, bb.B)
 	if len(metainfoBuf) == 0 {
-		qt.Printf("nothing found")
 		return nil, ec.Start
 	}
 	var mi rollupResultCacheMetainfo
@@ -227,7 +198,6 @@ func (rrc *rollupResultCache) Get(qt *querytracer.Tracer, ec *EvalConfig, expr m
 	}
 	key := mi.GetBestKey(ec.Start, ec.End)
 	if key.prefix == 0 && key.suffix == 0 {
-		qt.Printf("nothing found on the timeRange")
 		return nil, ec.Start
 	}
 	bb.B = key.Marshal(bb.B[:0])
@@ -237,24 +207,20 @@ func (rrc *rollupResultCache) Get(qt *querytracer.Tracer, ec *EvalConfig, expr m
 	if len(compressedResultBuf.B) == 0 {
 		mi.RemoveKey(key)
 		metainfoBuf = mi.Marshal(metainfoBuf[:0])
-		bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step, ec.EnforcedTagFilterss)
+		bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step, ec.EnforcedTagFilters)
 		rrc.c.Set(bb.B, metainfoBuf)
-		qt.Printf("missing cache entry")
 		return nil, ec.Start
 	}
 	// Decompress into newly allocated byte slice, since tss returned from unmarshalTimeseriesFast
 	// refers to the byte slice, so it cannot be returned to the resultBufPool.
-	qt.Printf("load compressed entry from cache with size %d bytes", len(compressedResultBuf.B))
 	resultBuf, err := encoding.DecompressZSTD(nil, compressedResultBuf.B)
 	if err != nil {
 		logger.Panicf("BUG: cannot decompress resultBuf from rollupResultCache: %s; it looks like it was improperly saved", err)
 	}
-	qt.Printf("unpack the entry into %d bytes", len(resultBuf))
 	tss, err = unmarshalTimeseriesFast(resultBuf)
 	if err != nil {
 		logger.Panicf("BUG: cannot unmarshal timeseries from rollupResultCache: %s; it looks like it was improperly saved", err)
 	}
-	qt.Printf("unmarshal %d series", len(tss))
 
 	// Extract values for the matching timestamps
 	timestamps := tss[0].Timestamps
@@ -264,12 +230,10 @@ func (rrc *rollupResultCache) Get(qt *querytracer.Tracer, ec *EvalConfig, expr m
 	}
 	if i == len(timestamps) {
 		// no matches.
-		qt.Printf("no datapoints found in the cached series on the given timeRange")
 		return nil, ec.Start
 	}
 	if timestamps[i] != ec.Start {
 		// The cached range doesn't cover the requested range.
-		qt.Printf("cached series don't cover the given timeRange")
 		return nil, ec.Start
 	}
 
@@ -290,25 +254,13 @@ func (rrc *rollupResultCache) Get(qt *querytracer.Tracer, ec *EvalConfig, expr m
 
 	timestamps = tss[0].Timestamps
 	newStart = timestamps[len(timestamps)-1] + ec.Step
-	if qt.Enabled() {
-		startString := storage.TimestampToHumanReadableFormat(ec.Start)
-		endString := storage.TimestampToHumanReadableFormat(newStart - ec.Step)
-		qt.Printf("return %d series on a timeRange=[%s..%s]", len(tss), startString, endString)
-	}
 	return tss, newStart
 }
 
 var resultBufPool bytesutil.ByteBufferPool
 
-func (rrc *rollupResultCache) Put(qt *querytracer.Tracer, ec *EvalConfig, expr metricsql.Expr, window int64, tss []*timeseries) {
-	if qt.Enabled() {
-		query := string(expr.AppendString(nil))
-		query = bytesutil.LimitStringLen(query, 300)
-		qt = qt.NewChild("rollup cache put: query=%s, timeRange=%s, step=%d, window=%d, series=%d", query, ec.timeRangeString(), ec.Step, window, len(tss))
-		defer qt.Done()
-	}
+func (rrc *rollupResultCache) Put(ec *EvalConfig, expr metricsql.Expr, window int64, tss []*timeseries) {
 	if len(tss) == 0 || !ec.mayCache() {
-		qt.Printf("do not store series to cache, since it is disabled in the current context")
 		return
 	}
 
@@ -323,7 +275,6 @@ func (rrc *rollupResultCache) Put(qt *querytracer.Tracer, ec *EvalConfig, expr m
 	i++
 	if i == 0 {
 		// Nothing to store in the cache.
-		qt.Printf("nothing to store in the cache, since all the points have timestamps bigger than %d", deadline)
 		return
 	}
 	if i < len(timestamps) {
@@ -338,122 +289,65 @@ func (rrc *rollupResultCache) Put(qt *querytracer.Tracer, ec *EvalConfig, expr m
 	}
 
 	// Store tss in the cache.
-	metainfoKey := bbPool.Get()
-	defer bbPool.Put(metainfoKey)
-	metainfoBuf := bbPool.Get()
-	defer bbPool.Put(metainfoBuf)
-
-	metainfoKey.B = marshalRollupResultCacheKey(metainfoKey.B[:0], expr, window, ec.Step, ec.EnforcedTagFilterss)
-	metainfoBuf.B = rrc.c.Get(metainfoBuf.B[:0], metainfoKey.B)
-	var mi rollupResultCacheMetainfo
-	if len(metainfoBuf.B) > 0 {
-		if err := mi.Unmarshal(metainfoBuf.B); err != nil {
-			logger.Panicf("BUG: cannot unmarshal rollupResultCacheMetainfo: %s; it looks like it was improperly saved", err)
-		}
-	}
-	start := timestamps[0]
-	end := timestamps[len(timestamps)-1]
-	if mi.CoversTimeRange(start, end) {
-		if qt.Enabled() {
-			startString := storage.TimestampToHumanReadableFormat(start)
-			endString := storage.TimestampToHumanReadableFormat(end)
-			qt.Printf("series on the given timeRange=[%s..%s] already exist in the cache", startString, endString)
-		}
-		return
-	}
-
 	maxMarshaledSize := getRollupResultCacheSize() / 4
 	resultBuf := resultBufPool.Get()
 	defer resultBufPool.Put(resultBuf)
 	resultBuf.B = marshalTimeseriesFast(resultBuf.B[:0], tss, maxMarshaledSize, ec.Step)
 	if len(resultBuf.B) == 0 {
 		tooBigRollupResults.Inc()
-		qt.Printf("cannot store series in the cache, since they would occupy more than %d bytes", maxMarshaledSize)
 		return
-	}
-	if qt.Enabled() {
-		startString := storage.TimestampToHumanReadableFormat(start)
-		endString := storage.TimestampToHumanReadableFormat(end)
-		qt.Printf("marshal %d series on a timeRange=[%s..%s] into %d bytes", len(tss), startString, endString, len(resultBuf.B))
 	}
 	compressedResultBuf := resultBufPool.Get()
 	defer resultBufPool.Put(compressedResultBuf)
 	compressedResultBuf.B = encoding.CompressZSTDLevel(compressedResultBuf.B[:0], resultBuf.B, 1)
-	qt.Printf("compress %d bytes into %d bytes", len(resultBuf.B), len(compressedResultBuf.B))
+
+	bb := bbPool.Get()
+	defer bbPool.Put(bb)
 
 	var key rollupResultCacheKey
 	key.prefix = rollupResultCacheKeyPrefix
 	key.suffix = atomic.AddUint64(&rollupResultCacheKeySuffix, 1)
-	rollupResultKey := key.Marshal(nil)
-	rrc.c.SetBig(rollupResultKey, compressedResultBuf.B)
-	qt.Printf("store %d bytes in the cache", len(compressedResultBuf.B))
+	bb.B = key.Marshal(bb.B[:0])
+	rrc.c.SetBig(bb.B, compressedResultBuf.B)
 
+	bb.B = marshalRollupResultCacheKey(bb.B[:0], expr, window, ec.Step, ec.EnforcedTagFilters)
+	metainfoBuf := rrc.c.Get(nil, bb.B)
+	var mi rollupResultCacheMetainfo
+	if len(metainfoBuf) > 0 {
+		if err := mi.Unmarshal(metainfoBuf); err != nil {
+			logger.Panicf("BUG: cannot unmarshal rollupResultCacheMetainfo: %s; it looks like it was improperly saved", err)
+		}
+	}
 	mi.AddKey(key, timestamps[0], timestamps[len(timestamps)-1])
-	metainfoBuf.B = mi.Marshal(metainfoBuf.B[:0])
-	rrc.c.Set(metainfoKey.B, metainfoBuf.B)
+	metainfoBuf = mi.Marshal(metainfoBuf[:0])
+	rrc.c.Set(bb.B, metainfoBuf)
 }
 
 var (
-	rollupResultCacheKeyPrefix uint64
+	rollupResultCacheKeyPrefix = func() uint64 {
+		var buf [8]byte
+		if _, err := rand.Read(buf[:]); err != nil {
+			// do not use logger.Panicf, since it isn't initialized yet.
+			panic(fmt.Errorf("FATAL: cannot read random data for rollupResultCacheKeyPrefix: %w", err))
+		}
+		return encoding.UnmarshalUint64(buf[:])
+	}()
 	rollupResultCacheKeySuffix = uint64(time.Now().UnixNano())
 )
-
-func newRollupResultCacheKeyPrefix() uint64 {
-	var buf [8]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		// do not use logger.Panicf, since it isn't initialized yet.
-		panic(fmt.Errorf("FATAL: cannot read random data for rollupResultCacheKeyPrefix: %w", err))
-	}
-	return encoding.UnmarshalUint64(buf[:])
-}
-
-func mustLoadRollupResultCacheKeyPrefix(path string) {
-	path = path + ".key.prefix"
-	if !fs.IsPathExist(path) {
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
-		return
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		logger.Errorf("cannot load %s: %s; reset rollupResult cache", path, err)
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
-		return
-	}
-	if len(data) != 8 {
-		logger.Errorf("unexpected size of %s; want 8 bytes; got %d bytes; reset rollupResult cache", path, len(data))
-		rollupResultCacheKeyPrefix = newRollupResultCacheKeyPrefix()
-		return
-	}
-	rollupResultCacheKeyPrefix = encoding.UnmarshalUint64(data)
-}
-
-func mustSaveRollupResultCacheKeyPrefix(path string) {
-	path = path + ".key.prefix"
-	data := encoding.MarshalUint64(nil, rollupResultCacheKeyPrefix)
-	fs.MustRemoveAll(path)
-	if err := fs.WriteFileAtomically(path, data); err != nil {
-		logger.Fatalf("cannot store rollupResult cache key prefix to %q: %s", path, err)
-	}
-}
 
 var tooBigRollupResults = metrics.NewCounter("vm_too_big_rollup_results_total")
 
 // Increment this value every time the format of the cache changes.
 const rollupResultCacheVersion = 8
 
-func marshalRollupResultCacheKey(dst []byte, expr metricsql.Expr, window, step int64, etfs [][]storage.TagFilter) []byte {
+func marshalRollupResultCacheKey(dst []byte, expr metricsql.Expr, window, step int64, filters []storage.TagFilter) []byte {
 	dst = append(dst, rollupResultCacheVersion)
 	dst = encoding.MarshalUint64(dst, rollupResultCacheKeyPrefix)
 	dst = encoding.MarshalInt64(dst, window)
 	dst = encoding.MarshalInt64(dst, step)
 	dst = expr.AppendString(dst)
-	for i, etf := range etfs {
-		for _, f := range etf {
-			dst = f.Marshal(dst)
-		}
-		if i+1 < len(etfs) {
-			dst = append(dst, '|')
-		}
+	for _, f := range filters {
+		dst = f.Marshal(dst)
 	}
 	return dst
 }
@@ -576,36 +470,20 @@ func (mi *rollupResultCacheMetainfo) Unmarshal(src []byte) error {
 	return nil
 }
 
-func (mi *rollupResultCacheMetainfo) CoversTimeRange(start, end int64) bool {
-	if start > end {
-		logger.Panicf("BUG: start cannot exceed end; got %d vs %d", start, end)
-	}
-	for i := range mi.entries {
-		e := &mi.entries[i]
-		if start >= e.start && end <= e.end {
-			return true
-		}
-	}
-	return false
-}
-
 func (mi *rollupResultCacheMetainfo) GetBestKey(start, end int64) rollupResultCacheKey {
 	if start > end {
 		logger.Panicf("BUG: start cannot exceed end; got %d vs %d", start, end)
 	}
 	var bestKey rollupResultCacheKey
-	dMax := int64(0)
+	bestD := int64(1<<63 - 1)
 	for i := range mi.entries {
 		e := &mi.entries[i]
-		if start < e.start {
+		if start < e.start || end <= e.start {
 			continue
 		}
-		d := e.end - start
-		if end <= e.end {
-			d = end - start
-		}
-		if d >= dMax {
-			dMax = d
+		d := start - e.start
+		if d < bestD {
+			bestD = d
 			bestKey = e.key
 		}
 	}

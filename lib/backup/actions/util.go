@@ -21,7 +21,6 @@ var (
 	configProfile = flag.String("configProfile", "", "Profile name for S3 configs. If no set, the value of the environment variable will be loaded (AWS_PROFILE or AWS_DEFAULT_PROFILE), "+
 		"or if both not set, DefaultSharedConfigProfile is used")
 	customS3Endpoint = flag.String("customS3Endpoint", "", "Custom S3 endpoint for use with S3-compatible storages (e.g. MinIO). S3 is used if not set")
-	s3ForcePathStyle = flag.Bool("s3ForcePathStyle", true, "Prefixing endpoint with bucket name when set false, true by default.")
 )
 
 func runParallel(concurrency int, parts []common.Part, f func(p common.Part) error, progress func(elapsed time.Duration)) error {
@@ -183,7 +182,7 @@ func NewRemoteFS(path string) (common.RemoteFS, error) {
 	}
 	n := strings.Index(path, "://")
 	if n < 0 {
-		return nil, fmt.Errorf("Missing scheme in path %q. Supported schemes: `gs://`, `s3://`, `fs://`", path)
+		return nil, fmt.Errorf("Missing scheme in path %q. Supported schemes: `gcs://`, `s3://`, `fs://`", path)
 	}
 	scheme := path[:n]
 	dir := path[n+len("://"):]
@@ -196,7 +195,7 @@ func NewRemoteFS(path string) (common.RemoteFS, error) {
 			Dir: dir,
 		}
 		return fs, nil
-	case "gcs", "gs":
+	case "gcs":
 		n := strings.Index(dir, "/")
 		if n < 0 {
 			return nil, fmt.Errorf("missing directory on the gcs bucket %q", dir)
@@ -220,13 +219,12 @@ func NewRemoteFS(path string) (common.RemoteFS, error) {
 		bucket := dir[:n]
 		dir = dir[n:]
 		fs := &s3remote.FS{
-			CredsFilePath:    *credsFilePath,
-			ConfigFilePath:   *configFilePath,
-			CustomEndpoint:   *customS3Endpoint,
-			S3ForcePathStyle: *s3ForcePathStyle,
-			ProfileName:      *configProfile,
-			Bucket:           bucket,
-			Dir:              dir,
+			CredsFilePath:  *credsFilePath,
+			ConfigFilePath: *configFilePath,
+			CustomEndpoint: *customS3Endpoint,
+			ProfileName:    *configProfile,
+			Bucket:         bucket,
+			Dir:            dir,
 		}
 		if err := fs.Init(); err != nil {
 			return nil, fmt.Errorf("cannot initialize connection to s3: %w", err)

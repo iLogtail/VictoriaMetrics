@@ -1,8 +1,9 @@
 package storage
 
 import (
+	"sync"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 )
@@ -55,25 +56,16 @@ func (mp *inmemoryPart) NewPart() (*part, error) {
 }
 
 func getInmemoryPart() *inmemoryPart {
-	select {
-	case mp := <-mpPool:
-		return mp
-	default:
+	v := mpPool.Get()
+	if v == nil {
 		return &inmemoryPart{}
 	}
+	return v.(*inmemoryPart)
 }
 
 func putInmemoryPart(mp *inmemoryPart) {
 	mp.Reset()
-	select {
-	case mpPool <- mp:
-	default:
-		// Drop mp in order to reduce memory usage.
-	}
+	mpPool.Put(mp)
 }
 
-// Use chan instead of sync.Pool in order to reduce memory usage on systems with big number of CPU cores,
-// since sync.Pool maintains per-CPU pool of inmemoryPart objects.
-//
-// The inmemoryPart object size can exceed 64KB, so it is better to use chan instead of sync.Pool for reducing memory usage.
-var mpPool = make(chan *inmemoryPart, cgroup.AvailableCPUs())
+var mpPool sync.Pool

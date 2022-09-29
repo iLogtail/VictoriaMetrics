@@ -36,8 +36,7 @@ func CalibrateScale(a []int64, ae int16, b []int64, be int16) (e int16) {
 	}
 	upExp -= downExp
 	for i, v := range a {
-		if isSpecialValue(v) {
-			// Do not take into account special values.
+		if v == vInfPos || v == vInfNeg {
 			continue
 		}
 		adjExp := upExp
@@ -49,8 +48,7 @@ func CalibrateScale(a []int64, ae int16, b []int64, be int16) (e int16) {
 	}
 	if downExp > 0 {
 		for i, v := range b {
-			if isSpecialValue(v) {
-				// Do not take into account special values.
+			if v == vInfPos || v == vInfNeg {
 				continue
 			}
 			adjExp := downExp
@@ -108,17 +106,13 @@ func AppendDecimalToFloat(dst []float64, va []int64, e int16) []float64 {
 		}
 		_ = a[len(va)-1]
 		for i, v := range va {
-			a[i] = float64(v)
-			if !isSpecialValue(v) {
-				continue
-			}
+			f := float64(v)
 			if v == vInfPos {
-				a[i] = infPos
+				f = infPos
 			} else if v == vInfNeg {
-				a[i] = infNeg
-			} else {
-				a[i] = StaleNaN
+				f = infNeg
 			}
+			a[i] = f
 		}
 		return dst[:len(dst)+len(va)]
 	}
@@ -128,34 +122,26 @@ func AppendDecimalToFloat(dst []float64, va []int64, e int16) []float64 {
 		e10 := math.Pow10(int(-e))
 		_ = a[len(va)-1]
 		for i, v := range va {
-			a[i] = float64(v) / e10
-			if !isSpecialValue(v) {
-				continue
-			}
+			f := float64(v) / e10
 			if v == vInfPos {
-				a[i] = infPos
+				f = infPos
 			} else if v == vInfNeg {
-				a[i] = infNeg
-			} else {
-				a[i] = StaleNaN
+				f = infNeg
 			}
+			a[i] = f
 		}
 		return dst[:len(dst)+len(va)]
 	}
 	e10 := math.Pow10(int(e))
 	_ = a[len(va)-1]
 	for i, v := range va {
-		a[i] = float64(v) * e10
-		if !isSpecialValue(v) {
-			continue
-		}
+		f := float64(v) * e10
 		if v == vInfPos {
-			a[i] = infPos
+			f = infPos
 		} else if v == vInfNeg {
-			a[i] = infNeg
-		} else {
-			a[i] = StaleNaN
+			f = infNeg
 		}
+		a[i] = f
 	}
 	return dst[:len(dst)+len(va)]
 }
@@ -198,7 +184,7 @@ func AppendFloatToDecimal(dst []int64, src []float64) ([]int64, int16) {
 		v, exp := FromFloat(f)
 		va[i] = v
 		ea[i] = exp
-		if exp < minExp && !isSpecialValue(v) {
+		if exp < minExp && v != vInfPos && v != vInfNeg {
 			minExp = exp
 		}
 	}
@@ -225,8 +211,7 @@ func AppendFloatToDecimal(dst []int64, src []float64) ([]int64, int16) {
 	_ = a[len(va)-1]
 	_ = ea[len(va)-1]
 	for i, v := range va {
-		if isSpecialValue(v) {
-			// There is no need in scaling special values.
+		if v == vInfPos || v == vInfNeg {
 			a[i] = v
 			continue
 		}
@@ -260,8 +245,8 @@ var vaeBufPool sync.Pool
 const int64Max = int64(1<<63 - 1)
 
 func maxUpExponent(v int64) int16 {
-	if v == 0 || isSpecialValue(v) {
-		// Any exponent allowed for zeroes and special values.
+	if v == 0 || v == vInfPos || v == vInfNeg {
+		// Any exponent allowed.
 		return 1024
 	}
 	if v < 0 {
@@ -317,10 +302,6 @@ func maxUpExponent(v int64) int16 {
 //
 // See also RoundToSignificantFigures.
 func RoundToDecimalDigits(f float64, digits int) float64 {
-	if IsStaleNaN(f) {
-		// Do not modify stale nan mark value.
-		return f
-	}
 	if digits <= -100 || digits >= 100 {
 		return f
 	}
@@ -332,10 +313,6 @@ func RoundToDecimalDigits(f float64, digits int) float64 {
 //
 // See also RoundToDecimalDigits.
 func RoundToSignificantFigures(f float64, digits int) float64 {
-	if IsStaleNaN(f) {
-		// Do not modify stale nan mark value.
-		return f
-	}
 	if digits <= 0 || digits >= 18 {
 		return f
 	}
@@ -368,14 +345,11 @@ func RoundToSignificantFigures(f float64, digits int) float64 {
 
 // ToFloat returns f=v*10^e.
 func ToFloat(v int64, e int16) float64 {
-	if isSpecialValue(v) {
-		if v == vInfPos {
-			return infPos
-		}
-		if v == vInfNeg {
-			return infNeg
-		}
-		return StaleNaN
+	if v == vInfPos {
+		return infPos
+	}
+	if v == vInfNeg {
+		return infNeg
 	}
 	f := float64(v)
 	// increase conversion precision for negative exponents by dividing by e10
@@ -390,45 +364,23 @@ var (
 	infNeg = math.Inf(-1)
 )
 
-// StaleNaN is a special NaN value, which is used as Prometheus staleness mark.
-// See https://www.robustperception.io/staleness-and-promql
-var StaleNaN = math.Float64frombits(staleNaNBits)
-
 const (
-	vInfPos   = 1<<63 - 1
-	vInfNeg   = -1 << 63
-	vStaleNaN = 1<<63 - 2
+	vInfPos = 1<<63 - 1
+	vInfNeg = -1 << 63
 
 	vMax = 1<<63 - 3
 	vMin = -1<<63 + 1
-
-	// staleNaNbits is bit representation of Prometheus staleness mark (aka stale NaN).
-	// This mark is put by Prometheus at the end of time series for improving staleness detection.
-	// See https://www.robustperception.io/staleness-and-promql
-	staleNaNBits uint64 = 0x7ff0000000000002
 )
-
-func isSpecialValue(v int64) bool {
-	return v > vMax || v < vMin
-}
-
-// IsStaleNaN returns true if f represents Prometheus staleness mark.
-func IsStaleNaN(f float64) bool {
-	return math.Float64bits(f) == staleNaNBits
-}
 
 // FromFloat converts f to v*10^e.
 //
 // It tries minimizing v.
 // For instance, for f = -1.234 it returns v = -1234, e = -3.
 //
-// FromFloat doesn't work properly with NaN values other than Prometheus staleness mark, so don't pass them here.
+// FromFloat doesn't work properly with NaN values, so don't pass them here.
 func FromFloat(f float64) (int64, int16) {
 	if f == 0 {
 		return 0, 0
-	}
-	if IsStaleNaN(f) {
-		return vStaleNaN, 0
 	}
 	if math.IsInf(f, 0) {
 		return fromFloatInf(f)

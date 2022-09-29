@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/awsapi"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 )
 
@@ -15,11 +14,10 @@ func getInstancesLabels(cfg *apiConfig) ([]map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	azMap := getAZMap(cfg)
 	var ms []map[string]string
 	for _, r := range rs {
 		for _, inst := range r.InstanceSet.Items {
-			ms = inst.appendTargetLabels(ms, r.OwnerID, cfg.port, azMap)
+			ms = inst.appendTargetLabels(ms, r.OwnerID, cfg.port)
 		}
 	}
 	return ms, nil
@@ -27,11 +25,11 @@ func getInstancesLabels(cfg *apiConfig) ([]map[string]string, error) {
 
 func getReservations(cfg *apiConfig) ([]Reservation, error) {
 	// See https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeInstances.html
+	action := "DescribeInstances"
 	var rs []Reservation
 	pageToken := ""
-	instanceFilters := awsapi.GetFiltersQueryString(cfg.instanceFilters)
 	for {
-		data, err := cfg.awsConfig.GetEC2APIResponse("DescribeInstances", instanceFilters, pageToken)
+		data, err := getEC2APIResponse(cfg, action, pageToken)
 		if err != nil {
 			return nil, fmt.Errorf("cannot obtain instances: %w", err)
 		}
@@ -134,30 +132,29 @@ func parseInstancesResponse(data []byte) (*InstancesResponse, error) {
 	return &v, nil
 }
 
-func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID string, port int, azMap map[string]string) []map[string]string {
+func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID string, port int) []map[string]string {
 	if len(inst.PrivateIPAddress) == 0 {
 		// Cannot scrape instance without private IP address
 		return ms
 	}
 	addr := discoveryutils.JoinHostPort(inst.PrivateIPAddress, port)
 	m := map[string]string{
-		"__address__":                     addr,
-		"__meta_ec2_architecture":         inst.Architecture,
-		"__meta_ec2_ami":                  inst.ImageID,
-		"__meta_ec2_availability_zone":    inst.Placement.AvailabilityZone,
-		"__meta_ec2_availability_zone_id": azMap[inst.Placement.AvailabilityZone],
-		"__meta_ec2_instance_id":          inst.ID,
-		"__meta_ec2_instance_lifecycle":   inst.Lifecycle,
-		"__meta_ec2_instance_state":       inst.State.Name,
-		"__meta_ec2_instance_type":        inst.Type,
-		"__meta_ec2_owner_id":             ownerID,
-		"__meta_ec2_platform":             inst.Platform,
-		"__meta_ec2_primary_subnet_id":    inst.SubnetID,
-		"__meta_ec2_private_dns_name":     inst.PrivateDNSName,
-		"__meta_ec2_private_ip":           inst.PrivateIPAddress,
-		"__meta_ec2_public_dns_name":      inst.PublicDNSName,
-		"__meta_ec2_public_ip":            inst.PublicIPAddress,
-		"__meta_ec2_vpc_id":               inst.VPCID,
+		"__address__":                   addr,
+		"__meta_ec2_architecture":       inst.Architecture,
+		"__meta_ec2_ami":                inst.ImageID,
+		"__meta_ec2_availability_zone":  inst.Placement.AvailabilityZone,
+		"__meta_ec2_instance_id":        inst.ID,
+		"__meta_ec2_instance_lifecycle": inst.Lifecycle,
+		"__meta_ec2_instance_state":     inst.State.Name,
+		"__meta_ec2_instance_type":      inst.Type,
+		"__meta_ec2_owner_id":           ownerID,
+		"__meta_ec2_platform":           inst.Platform,
+		"__meta_ec2_primary_subnet_id":  inst.SubnetID,
+		"__meta_ec2_private_dns_name":   inst.PrivateDNSName,
+		"__meta_ec2_private_ip":         inst.PrivateIPAddress,
+		"__meta_ec2_public_dns_name":    inst.PublicDNSName,
+		"__meta_ec2_public_ip":          inst.PublicIPAddress,
+		"__meta_ec2_vpc_id":             inst.VPCID,
 	}
 	if len(inst.VPCID) > 0 {
 		subnets := make([]string, 0, len(inst.NetworkInterfaceSet.Items))
@@ -186,7 +183,8 @@ func (inst *Instance) appendTargetLabels(ms []map[string]string, ownerID string,
 		if len(t.Key) == 0 || len(t.Value) == 0 {
 			continue
 		}
-		m[discoveryutils.SanitizeLabelName("__meta_ec2_tag_"+t.Key)] = t.Value
+		name := discoveryutils.SanitizeLabelName(t.Key)
+		m["__meta_ec2_tag_"+name] = t.Value
 	}
 	ms = append(ms, m)
 	return ms

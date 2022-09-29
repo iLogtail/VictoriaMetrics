@@ -10,7 +10,6 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ingestserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/netutil"
 	"github.com/VictoriaMetrics/metrics"
@@ -30,7 +29,6 @@ type Server struct {
 	lnTCP net.Listener
 	lnUDP net.PacketConn
 	wg    sync.WaitGroup
-	cm    ingestserver.ConnsMap
 }
 
 // MustStart starts graphite server on the given addr.
@@ -40,7 +38,7 @@ type Server struct {
 // MustStop must be called on the returned server when it is no longer needed.
 func MustStart(addr string, insertHandler func(r io.Reader) error) *Server {
 	logger.Infof("starting TCP Graphite server at %q", addr)
-	lnTCP, err := netutil.NewTCPListener("graphite", addr, nil)
+	lnTCP, err := netutil.NewTCPListener("graphite", addr)
 	if err != nil {
 		logger.Fatalf("cannot start TCP Graphite server at %q: %s", addr, err)
 	}
@@ -56,17 +54,16 @@ func MustStart(addr string, insertHandler func(r io.Reader) error) *Server {
 		lnTCP: lnTCP,
 		lnUDP: lnUDP,
 	}
-	s.cm.Init()
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.serveTCP(insertHandler)
+		serveTCP(lnTCP, insertHandler)
 		logger.Infof("stopped TCP Graphite server at %q", addr)
 	}()
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.serveUDP(insertHandler)
+		serveUDP(lnUDP, insertHandler)
 		logger.Infof("stopped UDP Graphite server at %q", addr)
 	}()
 	return s
@@ -82,20 +79,18 @@ func (s *Server) MustStop() {
 	if err := s.lnUDP.Close(); err != nil {
 		logger.Errorf("cannot close UDP Graphite server: %s", err)
 	}
-	s.cm.CloseAll()
 	s.wg.Wait()
 	logger.Infof("TCP and UDP Graphite servers at %q have been stopped", s.addr)
 }
 
-func (s *Server) serveTCP(insertHandler func(r io.Reader) error) {
-	var wg sync.WaitGroup
+func serveTCP(ln net.Listener, insertHandler func(r io.Reader) error) {
 	for {
-		c, err := s.lnTCP.Accept()
+		c, err := ln.Accept()
 		if err != nil {
 			var ne net.Error
 			if errors.As(err, &ne) {
 				if ne.Temporary() {
-					logger.Errorf("graphite: temporary error when listening for TCP addr %q: %s", s.lnTCP.Addr(), err)
+					logger.Errorf("graphite: temporary error when listening for TCP addr %q: %s", ln.Addr(), err)
 					time.Sleep(time.Second)
 					continue
 				}
@@ -106,28 +101,18 @@ func (s *Server) serveTCP(insertHandler func(r io.Reader) error) {
 			}
 			logger.Fatalf("unexpected error when accepting TCP Graphite connections: %s", err)
 		}
-		if !s.cm.Add(c) {
-			_ = c.Close()
-			break
-		}
-		wg.Add(1)
 		go func() {
-			defer func() {
-				s.cm.Delete(c)
-				_ = c.Close()
-				wg.Done()
-			}()
 			writeRequestsTCP.Inc()
 			if err := insertHandler(c); err != nil {
 				writeErrorsTCP.Inc()
 				logger.Errorf("error in TCP Graphite conn %q<->%q: %s", c.LocalAddr(), c.RemoteAddr(), err)
 			}
+			_ = c.Close()
 		}()
 	}
-	wg.Wait()
 }
 
-func (s *Server) serveUDP(insertHandler func(r io.Reader) error) {
+func serveUDP(ln net.PacketConn, insertHandler func(r io.Reader) error) {
 	gomaxprocs := cgroup.AvailableCPUs()
 	var wg sync.WaitGroup
 	for i := 0; i < gomaxprocs; i++ {
@@ -135,17 +120,17 @@ func (s *Server) serveUDP(insertHandler func(r io.Reader) error) {
 		go func() {
 			defer wg.Done()
 			var bb bytesutil.ByteBuffer
-			bb.B = bytesutil.ResizeNoCopyNoOverallocate(bb.B, 64*1024)
+			bb.B = bytesutil.Resize(bb.B, 64*1024)
 			for {
 				bb.Reset()
 				bb.B = bb.B[:cap(bb.B)]
-				n, addr, err := s.lnUDP.ReadFrom(bb.B)
+				n, addr, err := ln.ReadFrom(bb.B)
 				if err != nil {
 					writeErrorsUDP.Inc()
 					var ne net.Error
 					if errors.As(err, &ne) {
 						if ne.Temporary() {
-							logger.Errorf("graphite: temporary error when listening for UDP addr %q: %s", s.lnUDP.LocalAddr(), err)
+							logger.Errorf("graphite: temporary error when listening for UDP addr %q: %s", ln.LocalAddr(), err)
 							time.Sleep(time.Second)
 							continue
 						}
@@ -160,7 +145,7 @@ func (s *Server) serveUDP(insertHandler func(r io.Reader) error) {
 				writeRequestsUDP.Inc()
 				if err := insertHandler(bb.NewReader()); err != nil {
 					writeErrorsUDP.Inc()
-					logger.Errorf("error in UDP Graphite conn %q<->%q: %s", s.lnUDP.LocalAddr(), addr, err)
+					logger.Errorf("error in UDP Graphite conn %q<->%q: %s", ln.LocalAddr(), addr, err)
 					continue
 				}
 			}

@@ -3,12 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"reflect"
 	"sort"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
@@ -40,48 +38,27 @@ func (fq *fakeQuerier) add(metrics ...datasource.Metric) {
 	fq.Unlock()
 }
 
-func (fq *fakeQuerier) BuildWithParams(_ datasource.QuerierParams) datasource.Querier {
-	return fq
-}
-
-func (fq *fakeQuerier) QueryRange(ctx context.Context, q string, _, _ time.Time) ([]datasource.Metric, error) {
-	req, _, err := fq.Query(ctx, q, time.Now())
-	return req, err
-}
-
-func (fq *fakeQuerier) Query(_ context.Context, _ string, _ time.Time) ([]datasource.Metric, *http.Request, error) {
+func (fq *fakeQuerier) Query(_ context.Context, _ string, _ datasource.Type) ([]datasource.Metric, error) {
 	fq.Lock()
 	defer fq.Unlock()
 	if fq.err != nil {
-		return nil, nil, fq.err
+		return nil, fq.err
 	}
 	cp := make([]datasource.Metric, len(fq.metrics))
 	copy(cp, fq.metrics)
-	req, _ := http.NewRequest(http.MethodPost, "foo.com", nil)
-	return cp, req, nil
+	return cp, nil
 }
 
 type fakeNotifier struct {
 	sync.Mutex
 	alerts []notifier.Alert
-	// records number of received alerts in total
-	counter int
 }
 
-func (*fakeNotifier) Close()       {}
-func (*fakeNotifier) Addr() string { return "" }
 func (fn *fakeNotifier) Send(_ context.Context, alerts []notifier.Alert) error {
 	fn.Lock()
 	defer fn.Unlock()
-	fn.counter += len(alerts)
 	fn.alerts = alerts
 	return nil
-}
-
-func (fn *fakeNotifier) getCounter() int {
-	fn.Lock()
-	defer fn.Unlock()
-	return fn.counter
 }
 
 func (fn *fakeNotifier) getAlerts() []notifier.Alert {
@@ -90,29 +67,10 @@ func (fn *fakeNotifier) getAlerts() []notifier.Alert {
 	return fn.alerts
 }
 
-type faultyNotifier struct {
-	fakeNotifier
-}
-
-func (fn *faultyNotifier) Send(ctx context.Context, _ []notifier.Alert) error {
-	d, ok := ctx.Deadline()
-	if ok {
-		time.Sleep(time.Until(d))
-	}
-	return fmt.Errorf("send failed")
-}
-
 func metricWithValueAndLabels(t *testing.T, value float64, labels ...string) datasource.Metric {
-	return metricWithValuesAndLabels(t, []float64{value}, labels...)
-}
-
-func metricWithValuesAndLabels(t *testing.T, values []float64, labels ...string) datasource.Metric {
 	t.Helper()
 	m := metricWithLabels(t, labels...)
-	m.Values = values
-	for i := range values {
-		m.Timestamps = append(m.Timestamps, int64(i))
-	}
+	m.Value = value
 	return m
 }
 
@@ -121,7 +79,7 @@ func metricWithLabels(t *testing.T, labels ...string) datasource.Metric {
 	if len(labels) == 0 || len(labels)%2 != 0 {
 		t.Fatalf("expected to get even number of labels")
 	}
-	m := datasource.Metric{Values: []float64{1}, Timestamps: []int64{1}}
+	m := datasource.Metric{}
 	for i := 0; i < len(labels); i += 2 {
 		m.Labels = append(m.Labels, datasource.Label{
 			Name:  labels[i],
@@ -129,21 +87,6 @@ func metricWithLabels(t *testing.T, labels ...string) datasource.Metric {
 		})
 	}
 	return m
-}
-
-func toPromLabels(t *testing.T, labels ...string) []prompbmarshal.Label {
-	t.Helper()
-	if len(labels) == 0 || len(labels)%2 != 0 {
-		t.Fatalf("expected to get even number of labels")
-	}
-	var ls []prompbmarshal.Label
-	for i := 0; i < len(labels); i += 2 {
-		ls = append(ls, prompbmarshal.Label{
-			Name:  labels[i],
-			Value: labels[i+1],
-		})
-	}
-	return ls
 }
 
 func compareGroups(t *testing.T, a, b *Group) {
@@ -167,7 +110,7 @@ func compareGroups(t *testing.T, a, b *Group) {
 			t.Fatalf("expected to have rule %q; got %q", want.ID(), got.ID())
 		}
 		if err := compareRules(t, want, got); err != nil {
-			t.Fatalf("comparison error: %s", err)
+			t.Fatalf("comparsion error: %s", err)
 		}
 	}
 }
@@ -217,9 +160,6 @@ func compareAlertingRules(t *testing.T, a, b *AlertingRule) error {
 	if !reflect.DeepEqual(a.Labels, b.Labels) {
 		return fmt.Errorf("expected to have labels %#v; got %#v", a.Labels, b.Labels)
 	}
-	if a.Type.String() != b.Type.String() {
-		return fmt.Errorf("expected to have Type %#v; got %#v", a.Type.String(), b.Type.String())
-	}
 	return nil
 }
 
@@ -245,8 +185,7 @@ func compareTimeSeries(t *testing.T, a, b []prompbmarshal.TimeSeries) error {
 			}*/
 		}
 		if len(expTS.Labels) != len(gotTS.Labels) {
-			return fmt.Errorf("expected number of labels %d (%v); got %d (%v)",
-				len(expTS.Labels), expTS.Labels, len(gotTS.Labels), gotTS.Labels)
+			return fmt.Errorf("expected number of labels %d; got %d", len(expTS.Labels), len(gotTS.Labels))
 		}
 		for i, exp := range expTS.Labels {
 			got := gotTS.Labels[i]

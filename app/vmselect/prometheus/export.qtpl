@@ -1,11 +1,9 @@
 {% import (
 	"bytes"
-	"math"
 	"strings"
 	"time"
 
 	"github.com/valyala/quicktemplate"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 ) %}
 
@@ -102,7 +100,7 @@
 				{%f= values[0] %}
 				{% code values = values[1:] %}
 				{% for _, v := range values %}
-				  ,{% if math.IsNaN(v) %}null{% else %}{%f= v %}{% endif %}
+					,{%f= v %}
 				{% endfor %}
 			{% endif %}
 		],
@@ -126,12 +124,8 @@
 }
 {% endfunc %}
 
-{% func ExportPromAPIResponse(resultsCh <-chan *quicktemplate.ByteBuffer, qt *querytracer.Tracer) %}
+{% func ExportPromAPIResponse(resultsCh <-chan *quicktemplate.ByteBuffer) %}
 {
-	{% code
-		lines := 0
-		bytesTotal := 0
-	%}
 	"status":"success",
 	"data":{
 		"resultType":"matrix",
@@ -139,30 +133,18 @@
 			{% code bb, ok := <-resultsCh %}
 			{% if ok %}
 				{%z= bb.B %}
-				{% code
-					lines++
-					bytesTotal += len(bb.B)
-					quicktemplate.ReleaseByteBuffer(bb)
-				%}
+				{% code quicktemplate.ReleaseByteBuffer(bb) %}
 				{% for bb := range resultsCh %}
 					,{%z= bb.B %}
-					{% code
-						lines++
-						bytesTotal += len(bb.B)
-						quicktemplate.ReleaseByteBuffer(bb)
-					%}
+					{% code quicktemplate.ReleaseByteBuffer(bb) %}
 				{% endfor %}
 			{% endif %}
 		]
 	}
-	{% code
-		qt.Donef("export format=promapi: lines=%d, bytes=%d", lines, bytesTotal)
-	%}
-	{%= dumpQueryTrace(qt) %}
 }
 {% endfunc %}
 
-{% func ExportStdResponse(resultsCh <-chan *quicktemplate.ByteBuffer, qt *querytracer.Tracer) %}
+{% func ExportStdResponse(resultsCh <-chan *quicktemplate.ByteBuffer) %}
 	{% for bb := range resultsCh %}
 		{%z= bb.B %}
 		{% code quicktemplate.ReleaseByteBuffer(bb) %}

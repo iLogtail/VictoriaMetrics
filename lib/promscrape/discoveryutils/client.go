@@ -42,24 +42,14 @@ type Client struct {
 
 	apiServer string
 
-	hostPort                string
-	setFasthttpHeaders      func(req *fasthttp.Request)
-	setFasthttpProxyHeaders func(req *fasthttp.Request)
-	sendFullURL             bool
-}
-
-func addMissingPort(addr string, isTLS bool) string {
-	if strings.Contains(addr, ":") {
-		return addr
-	}
-	if isTLS {
-		return addr + ":443"
-	}
-	return addr + ":80"
+	hostPort        string
+	authHeader      string
+	proxyAuthHeader string
+	sendFullURL     bool
 }
 
 // NewClient returns new Client for the given args.
-func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxyAC *promauth.Config) (*Client, error) {
+func NewClient(apiServer string, ac *promauth.Config, proxyURL proxy.URL, proxyAC *promauth.Config) (*Client, error) {
 	var u fasthttp.URI
 	u.Update(apiServer)
 
@@ -74,32 +64,33 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 	}
 
 	hostPort := string(u.Host())
-	dialAddr := hostPort
 	isTLS := string(u.Scheme()) == "https"
 	var tlsCfg *tls.Config
 	if isTLS {
 		tlsCfg = ac.NewTLSConfig()
 	}
 	sendFullURL := !isTLS && proxyURL.IsHTTPOrHTTPS()
-	setFasthttpProxyHeaders := func(req *fasthttp.Request) {}
+	proxyAuthHeader := ""
 	if sendFullURL {
 		// Send full urls in requests to a proxy host for non-TLS apiServer
 		// like net/http package from Go does.
 		// See https://en.wikipedia.org/wiki/Proxy_server#Web_proxy_servers
-		pu := proxyURL.GetURL()
-		dialAddr = pu.Host
+		pu := proxyURL.URL()
+		hostPort = pu.Host
 		isTLS = pu.Scheme == "https"
 		if isTLS {
 			tlsCfg = proxyAC.NewTLSConfig()
 		}
-		proxyURLOrig := proxyURL
-		setFasthttpProxyHeaders = func(req *fasthttp.Request) {
-			proxyURLOrig.SetFasthttpHeaders(proxyAC, req)
-		}
-		proxyURL = &proxy.URL{}
+		proxyAuthHeader = proxyURL.GetAuthHeader(proxyAC)
+		proxyURL = proxy.URL{}
 	}
-	hostPort = addMissingPort(hostPort, isTLS)
-	dialAddr = addMissingPort(dialAddr, isTLS)
+	if !strings.Contains(hostPort, ":") {
+		port := "80"
+		if isTLS {
+			port = "443"
+		}
+		hostPort = net.JoinHostPort(hostPort, port)
+	}
 	if dialFunc == nil {
 		var err error
 		dialFunc, err = proxyURL.NewDialFunc(proxyAC)
@@ -108,7 +99,7 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 		}
 	}
 	hc := &fasthttp.HostClient{
-		Addr:                dialAddr,
+		Addr:                hostPort,
 		Name:                "vm_promscrape/discovery",
 		IsTLS:               isTLS,
 		TLSConfig:           tlsCfg,
@@ -119,7 +110,7 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 		Dial:                dialFunc,
 	}
 	blockingClient := &fasthttp.HostClient{
-		Addr:                dialAddr,
+		Addr:                hostPort,
 		Name:                "vm_promscrape/discovery",
 		IsTLS:               isTLS,
 		TLSConfig:           tlsCfg,
@@ -129,18 +120,18 @@ func NewClient(apiServer string, ac *promauth.Config, proxyURL *proxy.URL, proxy
 		MaxConns:            64 * 1024,
 		Dial:                dialFunc,
 	}
-	setFasthttpHeaders := func(req *fasthttp.Request) {}
+	authHeader := ""
 	if ac != nil {
-		setFasthttpHeaders = func(req *fasthttp.Request) { ac.SetFasthttpHeaders(req, true) }
+		authHeader = ac.Authorization
 	}
 	return &Client{
-		hc:                      hc,
-		blockingClient:          blockingClient,
-		apiServer:               apiServer,
-		hostPort:                hostPort,
-		setFasthttpHeaders:      setFasthttpHeaders,
-		setFasthttpProxyHeaders: setFasthttpProxyHeaders,
-		sendFullURL:             sendFullURL,
+		hc:              hc,
+		blockingClient:  blockingClient,
+		apiServer:       apiServer,
+		hostPort:        hostPort,
+		authHeader:      authHeader,
+		proxyAuthHeader: proxyAuthHeader,
+		sendFullURL:     sendFullURL,
 	}, nil
 }
 
@@ -161,19 +152,8 @@ func (c *Client) Addr() string {
 	return c.hc.Addr
 }
 
-// GetAPIResponseWithReqParams returns response for given absolute path with optional callback for request.
-// modifyRequestParams should never reference data from request.
-func (c *Client) GetAPIResponseWithReqParams(path string, modifyRequestParams func(request *fasthttp.Request)) ([]byte, error) {
-	return c.getAPIResponse(path, modifyRequestParams)
-}
-
 // GetAPIResponse returns response for the given absolute path.
 func (c *Client) GetAPIResponse(path string) ([]byte, error) {
-	return c.getAPIResponse(path, nil)
-}
-
-// GetAPIResponse returns response for the given absolute path with optional callback for request.
-func (c *Client) getAPIResponse(path string, modifyRequest func(request *fasthttp.Request)) ([]byte, error) {
 	// Limit the number of concurrent API requests.
 	concurrencyLimitChOnce.Do(concurrencyLimitChInit)
 	t := timerpool.Get(*maxWaitTime)
@@ -186,17 +166,17 @@ func (c *Client) getAPIResponse(path string, modifyRequest func(request *fasthtt
 			c.apiServer, *maxWaitTime, *maxConcurrency)
 	}
 	defer func() { <-concurrencyLimitCh }()
-	return c.getAPIResponseWithParamsAndClient(c.hc, path, modifyRequest, nil)
+	return c.getAPIResponseWithParamsAndClient(c.hc, path, nil)
 }
 
 // GetBlockingAPIResponse returns response for given absolute path with blocking client and optional callback for api response,
 // inspectResponse - should never reference data from response.
 func (c *Client) GetBlockingAPIResponse(path string, inspectResponse func(resp *fasthttp.Response)) ([]byte, error) {
-	return c.getAPIResponseWithParamsAndClient(c.blockingClient, path, nil, inspectResponse)
+	return c.getAPIResponseWithParamsAndClient(c.blockingClient, path, inspectResponse)
 }
 
-// getAPIResponseWithParamsAndClient returns response for the given absolute path with optional callback for request and for response.
-func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, path string, modifyRequest func(req *fasthttp.Request), inspectResponse func(resp *fasthttp.Response)) ([]byte, error) {
+// getAPIResponseWithParamsAndClient returns response for the given absolute path with optional callback for response.
+func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, path string, inspectResponse func(resp *fasthttp.Response)) ([]byte, error) {
 	requestURL := c.apiServer + path
 	var u fasthttp.URI
 	u.Update(requestURL)
@@ -208,10 +188,11 @@ func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, 
 	}
 	req.Header.SetHost(c.hostPort)
 	req.Header.Set("Accept-Encoding", "gzip")
-	c.setFasthttpHeaders(&req)
-	c.setFasthttpProxyHeaders(&req)
-	if modifyRequest != nil {
-		modifyRequest(&req)
+	if c.authHeader != "" {
+		req.Header.Set("Authorization", c.authHeader)
+	}
+	if c.proxyAuthHeader != "" {
+		req.Header.Set("Proxy-Authorization", c.proxyAuthHeader)
 	}
 
 	var resp fasthttp.Response
@@ -240,41 +221,27 @@ func (c *Client) getAPIResponseWithParamsAndClient(client *fasthttp.HostClient, 
 	return data, nil
 }
 
-// DoRequestWithPossibleRetry performs the given req at hc and stores the response at resp.
-func DoRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time, requestCounter, retryCounter *metrics.Counter) error {
-	sleepTime := time.Second
-	requestCounter.Inc()
+func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
+	discoveryRequests.Inc()
 	for {
 		// Use DoDeadline instead of Do even if hc.ReadTimeout is already set in order to guarantee the given deadline
 		// across multiple retries.
 		err := hc.DoDeadline(req, resp, deadline)
 		if err == nil {
-			statusCode := resp.StatusCode()
-			if statusCode != fasthttp.StatusTooManyRequests {
-				return nil
-			}
-		} else if err != fasthttp.ErrConnectionClosed && !strings.Contains(err.Error(), "broken pipe") {
+			return nil
+		}
+		if err != fasthttp.ErrConnectionClosed && !strings.Contains(err.Error(), "broken pipe") {
 			return err
 		}
-		// Retry request after exponentially increased sleep.
-		maxSleepTime := time.Until(deadline)
-		if sleepTime > maxSleepTime {
+		// Retry request if the server closes the keep-alive connection unless deadline exceeds.
+		if time.Since(deadline) >= 0 {
 			return fmt.Errorf("the server closes all the connection attempts: %w", err)
 		}
-		sleepTime += sleepTime
-		if sleepTime > maxSleepTime {
-			sleepTime = maxSleepTime
-		}
-		time.Sleep(sleepTime)
-		retryCounter.Inc()
+		discoveryRetries.Inc()
 	}
 }
 
-func doRequestWithPossibleRetry(hc *fasthttp.HostClient, req *fasthttp.Request, resp *fasthttp.Response, deadline time.Time) error {
-	return DoRequestWithPossibleRetry(hc, req, resp, deadline, discoveryRequests, discoveryRetries)
-}
-
 var (
-	discoveryRequests = metrics.NewCounter(`vm_promscrape_discovery_requests_total`)
 	discoveryRetries  = metrics.NewCounter(`vm_promscrape_discovery_retries_total`)
+	discoveryRequests = metrics.NewCounter(`vm_promscrape_discovery_requests_total`)
 )

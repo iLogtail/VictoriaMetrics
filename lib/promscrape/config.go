@@ -1,50 +1,41 @@
 package promscrape
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/url"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fs"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/digitalocean"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/dns"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/docker"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/dockerswarm"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/ec2"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/eureka"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/gce"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/http"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/openstack"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 	"github.com/VictoriaMetrics/metrics"
-	"github.com/cespare/xxhash/v2"
+	xxhash "github.com/cespare/xxhash/v2"
 	"gopkg.in/yaml.v2"
 )
 
 var (
-	strictParse = flag.Bool("promscrape.config.strictParse", true, "Whether to deny unsupported fields in -promscrape.config . Set to false in order to silently skip unsupported fields")
-	dryRun      = flag.Bool("promscrape.config.dryRun", false, "Checks -promscrape.config file for errors and unsupported fields and then exits. "+
+	strictParse = flag.Bool("promscrape.config.strictParse", false, "Whether to allow only supported fields in -promscrape.config . "+
+		"By default unsupported fields are silently skipped")
+	dryRun = flag.Bool("promscrape.config.dryRun", false, "Checks -promscrape.config file for errors and unsupported fields and then exits. "+
 		"Returns non-zero exit code on parsing errors and emits these errors to stderr. "+
 		"See also -promscrape.config.strictParse command-line flag. "+
 		"Pass -loggerLevel=ERROR if you don't need to see info messages in the output.")
@@ -54,180 +45,46 @@ var (
 	clusterMembersCount = flag.Int("promscrape.cluster.membersCount", 0, "The number of members in a cluster of scrapers. "+
 		"Each member must have an unique -promscrape.cluster.memberNum in the range 0 ... promscrape.cluster.membersCount-1 . "+
 		"Each member then scrapes roughly 1/N of all the targets. By default cluster scraping is disabled, i.e. a single scraper scrapes all the targets")
-	clusterMemberNum = flag.String("promscrape.cluster.memberNum", "0", "The number of number in the cluster of scrapers. "+
-		"It must be an unique value in the range 0 ... promscrape.cluster.membersCount-1 across scrapers in the cluster. "+
-		"Can be specified as pod name of Kubernetes StatefulSet - pod-name-Num, where Num is a numeric part of pod name")
+	clusterMemberNum = flag.Int("promscrape.cluster.memberNum", 0, "The number of number in the cluster of scrapers. "+
+		"It must be an unique value in the range 0 ... promscrape.cluster.membersCount-1 across scrapers in the cluster")
 	clusterReplicationFactor = flag.Int("promscrape.cluster.replicationFactor", 1, "The number of members in the cluster, which scrape the same targets. "+
-		"If the replication factor is greater than 1, then the deduplication must be enabled at remote storage side. See https://docs.victoriametrics.com/#deduplication")
-	clusterName = flag.String("promscrape.cluster.name", "", "Optional name of the cluster. If multiple vmagent clusters scrape the same targets, "+
-		"then each cluster must have unique name in order to properly de-duplicate samples received from these clusters. "+
-		"See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2679")
+		"If the replication factor is greater than 2, then the deduplication must be enabled at remote storage side. See https://victoriametrics.github.io/#deduplication")
 )
-
-var clusterMemberID int
-
-func mustInitClusterMemberID() {
-	s := *clusterMemberNum
-	// special case for kubernetes deployment, where pod-name formatted at some-pod-name-1
-	// obtain memberNum from last segment
-	// https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2359
-	if idx := strings.LastIndexByte(s, '-'); idx >= 0 {
-		s = s[idx+1:]
-	}
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		logger.Fatalf("cannot parse -promscrape.cluster.memberNum=%q: %s", *clusterMemberNum, err)
-	}
-	clusterMemberID = n
-}
 
 // Config represents essential parts from Prometheus config defined at https://prometheus.io/docs/prometheus/latest/configuration/configuration/
 type Config struct {
-	Global            GlobalConfig    `yaml:"global,omitempty"`
-	ScrapeConfigs     []*ScrapeConfig `yaml:"scrape_configs,omitempty"`
-	ScrapeConfigFiles []string        `yaml:"scrape_config_files,omitempty"`
+	Global        GlobalConfig   `yaml:"global"`
+	ScrapeConfigs []ScrapeConfig `yaml:"scrape_configs"`
 
 	// This is set to the directory from where the config has been loaded.
 	baseDir string
 }
 
-func (cfg *Config) unmarshal(data []byte, isStrict bool) error {
-	data = envtemplate.Replace(data)
-	var err error
-	if isStrict {
-		if err = yaml.UnmarshalStrict(data, cfg); err != nil {
-			err = fmt.Errorf("%w; pass -promscrape.config.strictParse=false command-line flag for ignoring unknown fields in yaml config", err)
-		}
-	} else {
-		err = yaml.Unmarshal(data, cfg)
-	}
-	return err
-}
-
-func (cfg *Config) marshal() []byte {
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		logger.Panicf("BUG: cannot marshal Config: %s", err)
-	}
-	return data
-}
-
 func (cfg *Config) mustStart() {
 	startTime := time.Now()
 	logger.Infof("starting service discovery routines...")
-	for _, sc := range cfg.ScrapeConfigs {
-		sc.mustStart(cfg.baseDir)
+	for i := range cfg.ScrapeConfigs {
+		cfg.ScrapeConfigs[i].mustStart(cfg.baseDir)
 	}
-	jobNames := cfg.getJobNames()
-	tsmGlobal.registerJobNames(jobNames)
 	logger.Infof("started service discovery routines in %.3f seconds", time.Since(startTime).Seconds())
-}
-
-func (cfg *Config) mustRestart(prevCfg *Config) {
-	startTime := time.Now()
-	logger.Infof("restarting service discovery routines...")
-
-	prevScrapeCfgByName := make(map[string]*ScrapeConfig, len(prevCfg.ScrapeConfigs))
-	for _, scPrev := range prevCfg.ScrapeConfigs {
-		prevScrapeCfgByName[scPrev.JobName] = scPrev
-	}
-
-	// Restart all the scrape jobs on Global config change.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2884
-	needGlobalRestart := !areEqualGlobalConfigs(&cfg.Global, &prevCfg.Global)
-
-	// Loop over the the new jobs, start new ones and restart updated ones.
-	var started, stopped, restarted int
-	currentJobNames := make(map[string]struct{}, len(cfg.ScrapeConfigs))
-	for i, sc := range cfg.ScrapeConfigs {
-		currentJobNames[sc.JobName] = struct{}{}
-		scPrev := prevScrapeCfgByName[sc.JobName]
-		if scPrev == nil {
-			// New scrape config has been appeared. Start it.
-			sc.mustStart(cfg.baseDir)
-			started++
-			continue
-		}
-		if !needGlobalRestart && areEqualScrapeConfigs(scPrev, sc) {
-			// The scrape config didn't change, so no need to restart it.
-			// Use the reference to the previous job, so it could be stopped properly later.
-			cfg.ScrapeConfigs[i] = scPrev
-		} else {
-			// The scrape config has been changed. Stop the previous scrape config and start new one.
-			scPrev.mustStop()
-			sc.mustStart(cfg.baseDir)
-			restarted++
-		}
-	}
-	// Stop preious jobs which weren't found in the current configuration.
-	for _, scPrev := range prevCfg.ScrapeConfigs {
-		if _, ok := currentJobNames[scPrev.JobName]; !ok {
-			scPrev.mustStop()
-			stopped++
-		}
-	}
-	jobNames := cfg.getJobNames()
-	tsmGlobal.registerJobNames(jobNames)
-	logger.Infof("restarted service discovery routines in %.3f seconds, stopped=%d, started=%d, restarted=%d", time.Since(startTime).Seconds(), stopped, started, restarted)
-}
-
-func areEqualGlobalConfigs(a, b *GlobalConfig) bool {
-	sa := a.marshalJSON()
-	sb := b.marshalJSON()
-	return string(sa) == string(sb)
-}
-
-func areEqualScrapeConfigs(a, b *ScrapeConfig) bool {
-	sa := a.marshalJSON()
-	sb := b.marshalJSON()
-	return string(sa) == string(sb)
-}
-
-func (sc *ScrapeConfig) unmarshalJSON(data []byte) error {
-	return json.Unmarshal(data, sc)
-}
-
-func (sc *ScrapeConfig) marshalJSON() []byte {
-	data, err := json.Marshal(sc)
-	if err != nil {
-		logger.Panicf("BUG: cannot marshal ScrapeConfig: %s", err)
-	}
-	return data
-}
-
-func (gc *GlobalConfig) marshalJSON() []byte {
-	data, err := json.Marshal(gc)
-	if err != nil {
-		logger.Panicf("BUG: cannot marshal GlobalConfig: %s", err)
-	}
-	return data
 }
 
 func (cfg *Config) mustStop() {
 	startTime := time.Now()
 	logger.Infof("stopping service discovery routines...")
-	for _, sc := range cfg.ScrapeConfigs {
-		sc.mustStop()
+	for i := range cfg.ScrapeConfigs {
+		cfg.ScrapeConfigs[i].mustStop()
 	}
 	logger.Infof("stopped service discovery routines in %.3f seconds", time.Since(startTime).Seconds())
-}
-
-// getJobNames returns all the scrape job names from the cfg.
-func (cfg *Config) getJobNames() []string {
-	a := make([]string, 0, len(cfg.ScrapeConfigs))
-	for _, sc := range cfg.ScrapeConfigs {
-		a = append(a, sc.JobName)
-	}
-	return a
 }
 
 // GlobalConfig represents essential parts for `global` section of Prometheus config.
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/
 type GlobalConfig struct {
-	ScrapeInterval *promutils.Duration `yaml:"scrape_interval,omitempty"`
-	ScrapeTimeout  *promutils.Duration `yaml:"scrape_timeout,omitempty"`
-	ExternalLabels map[string]string   `yaml:"external_labels,omitempty"`
+	ScrapeInterval time.Duration     `yaml:"scrape_interval,omitempty"`
+	ScrapeTimeout  time.Duration     `yaml:"scrape_timeout,omitempty"`
+	ExternalLabels map[string]string `yaml:"external_labels,omitempty"`
 }
 
 // ScrapeConfig represents essential parts for `scrape_config` section of Prometheus config.
@@ -235,45 +92,37 @@ type GlobalConfig struct {
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
 type ScrapeConfig struct {
 	JobName              string                      `yaml:"job_name"`
-	ScrapeInterval       *promutils.Duration         `yaml:"scrape_interval,omitempty"`
-	ScrapeTimeout        *promutils.Duration         `yaml:"scrape_timeout,omitempty"`
+	ScrapeInterval       time.Duration               `yaml:"scrape_interval,omitempty"`
+	ScrapeTimeout        time.Duration               `yaml:"scrape_timeout,omitempty"`
 	MetricsPath          string                      `yaml:"metrics_path,omitempty"`
 	HonorLabels          bool                        `yaml:"honor_labels,omitempty"`
-	HonorTimestamps      *bool                       `yaml:"honor_timestamps,omitempty"`
-	FollowRedirects      *bool                       `yaml:"follow_redirects,omitempty"`
+	HonorTimestamps      bool                        `yaml:"honor_timestamps,omitempty"`
+	FollowRedirects      *bool                       `yaml:"follow_redirects"` // omitempty isn't set, since the default value for this flag is true.
 	Scheme               string                      `yaml:"scheme,omitempty"`
 	Params               map[string][]string         `yaml:"params,omitempty"`
 	HTTPClientConfig     promauth.HTTPClientConfig   `yaml:",inline"`
-	ProxyURL             *proxy.URL                  `yaml:"proxy_url,omitempty"`
+	ProxyURL             proxy.URL                   `yaml:"proxy_url,omitempty"`
 	RelabelConfigs       []promrelabel.RelabelConfig `yaml:"relabel_configs,omitempty"`
 	MetricRelabelConfigs []promrelabel.RelabelConfig `yaml:"metric_relabel_configs,omitempty"`
 	SampleLimit          int                         `yaml:"sample_limit,omitempty"`
 
-	AzureSDConfigs        []azure.SDConfig        `yaml:"azure_sd_configs,omitempty"`
-	ConsulSDConfigs       []consul.SDConfig       `yaml:"consul_sd_configs,omitempty"`
-	DigitaloceanSDConfigs []digitalocean.SDConfig `yaml:"digitalocean_sd_configs,omitempty"`
-	DNSSDConfigs          []dns.SDConfig          `yaml:"dns_sd_configs,omitempty"`
-	DockerSDConfigs       []docker.SDConfig       `yaml:"docker_sd_configs,omitempty"`
-	DockerSwarmSDConfigs  []dockerswarm.SDConfig  `yaml:"dockerswarm_sd_configs,omitempty"`
-	EC2SDConfigs          []ec2.SDConfig          `yaml:"ec2_sd_configs,omitempty"`
-	EurekaSDConfigs       []eureka.SDConfig       `yaml:"eureka_sd_configs,omitempty"`
-	FileSDConfigs         []FileSDConfig          `yaml:"file_sd_configs,omitempty"`
-	GCESDConfigs          []gce.SDConfig          `yaml:"gce_sd_configs,omitempty"`
-	HTTPSDConfigs         []http.SDConfig         `yaml:"http_sd_configs,omitempty"`
-	KubernetesSDConfigs   []kubernetes.SDConfig   `yaml:"kubernetes_sd_configs,omitempty"`
-	OpenStackSDConfigs    []openstack.SDConfig    `yaml:"openstack_sd_configs,omitempty"`
-	StaticConfigs         []StaticConfig          `yaml:"static_configs,omitempty"`
-	YandexCloudSDConfigs  []yandexcloud.SDConfig  `yaml:"yandexcloud_sd_configs,omitempty"`
+	StaticConfigs        []StaticConfig         `yaml:"static_configs,omitempty"`
+	FileSDConfigs        []FileSDConfig         `yaml:"file_sd_configs,omitempty"`
+	KubernetesSDConfigs  []kubernetes.SDConfig  `yaml:"kubernetes_sd_configs,omitempty"`
+	OpenStackSDConfigs   []openstack.SDConfig   `yaml:"openstack_sd_configs,omitempty"`
+	ConsulSDConfigs      []consul.SDConfig      `yaml:"consul_sd_configs,omitempty"`
+	EurekaSDConfigs      []eureka.SDConfig      `yaml:"eureka_sd_configs,omitempty"`
+	DockerSwarmSDConfigs []dockerswarm.SDConfig `yaml:"dockerswarm_sd_configs,omitempty"`
+	DNSSDConfigs         []dns.SDConfig         `yaml:"dns_sd_configs,omitempty"`
+	EC2SDConfigs         []ec2.SDConfig         `yaml:"ec2_sd_configs,omitempty"`
+	GCESDConfigs         []gce.SDConfig         `yaml:"gce_sd_configs,omitempty"`
 
 	// These options are supported only by lib/promscrape.
-	RelabelDebug        bool                       `yaml:"relabel_debug,omitempty"`
-	MetricRelabelDebug  bool                       `yaml:"metric_relabel_debug,omitempty"`
 	DisableCompression  bool                       `yaml:"disable_compression,omitempty"`
 	DisableKeepAlive    bool                       `yaml:"disable_keepalive,omitempty"`
 	StreamParse         bool                       `yaml:"stream_parse,omitempty"`
-	ScrapeAlignInterval *promutils.Duration        `yaml:"scrape_align_interval,omitempty"`
-	ScrapeOffset        *promutils.Duration        `yaml:"scrape_offset,omitempty"`
-	SeriesLimit         int                        `yaml:"series_limit,omitempty"`
+	ScrapeAlignInterval time.Duration              `yaml:"scrape_align_interval,omitempty"`
+	ScrapeOffset        time.Duration              `yaml:"scrape_offset,omitempty"`
 	ProxyClientConfig   promauth.ProxyClientConfig `yaml:",inline"`
 
 	// This is set in loadConfig
@@ -296,41 +145,29 @@ func (sc *ScrapeConfig) mustStart(baseDir string) {
 }
 
 func (sc *ScrapeConfig) mustStop() {
-	for i := range sc.AzureSDConfigs {
-		sc.AzureSDConfigs[i].MustStop()
-	}
-	for i := range sc.ConsulSDConfigs {
-		sc.ConsulSDConfigs[i].MustStop()
-	}
-	for i := range sc.DigitaloceanSDConfigs {
-		sc.DigitaloceanSDConfigs[i].MustStop()
-	}
-	for i := range sc.DNSSDConfigs {
-		sc.DNSSDConfigs[i].MustStop()
-	}
-	for i := range sc.DockerSDConfigs {
-		sc.DockerSDConfigs[i].MustStop()
-	}
-	for i := range sc.DockerSwarmSDConfigs {
-		sc.DockerSwarmSDConfigs[i].MustStop()
-	}
-	for i := range sc.EC2SDConfigs {
-		sc.EC2SDConfigs[i].MustStop()
-	}
-	for i := range sc.EurekaSDConfigs {
-		sc.EurekaSDConfigs[i].MustStop()
-	}
-	for i := range sc.GCESDConfigs {
-		sc.GCESDConfigs[i].MustStop()
-	}
-	for i := range sc.HTTPSDConfigs {
-		sc.HTTPSDConfigs[i].MustStop()
-	}
 	for i := range sc.KubernetesSDConfigs {
 		sc.KubernetesSDConfigs[i].MustStop()
 	}
 	for i := range sc.OpenStackSDConfigs {
 		sc.OpenStackSDConfigs[i].MustStop()
+	}
+	for i := range sc.ConsulSDConfigs {
+		sc.ConsulSDConfigs[i].MustStop()
+	}
+	for i := range sc.EurekaSDConfigs {
+		sc.EurekaSDConfigs[i].MustStop()
+	}
+	for i := range sc.DockerSwarmSDConfigs {
+		sc.DockerSwarmSDConfigs[i].MustStop()
+	}
+	for i := range sc.DNSSDConfigs {
+		sc.DNSSDConfigs[i].MustStop()
+	}
+	for i := range sc.EC2SDConfigs {
+		sc.EC2SDConfigs[i].MustStop()
+	}
+	for i := range sc.GCESDConfigs {
+		sc.GCESDConfigs[i].MustStop()
 	}
 }
 
@@ -339,7 +176,7 @@ func (sc *ScrapeConfig) mustStop() {
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config
 type FileSDConfig struct {
 	Files []string `yaml:"files"`
-	// `refresh_interval` is ignored. See `-promscrape.fileSDCheckInterval`
+	// `refresh_interval` is ignored. See `-prometheus.fileSDCheckInterval`
 }
 
 // StaticConfig represents essential parts for `static_config` section of Prometheus config.
@@ -351,7 +188,7 @@ type StaticConfig struct {
 }
 
 func loadStaticConfigs(path string) ([]StaticConfig, error) {
-	data, err := fs.ReadFileOrHTTP(path)
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read `static_configs` from %q: %w", path, err)
 	}
@@ -364,49 +201,16 @@ func loadStaticConfigs(path string) ([]StaticConfig, error) {
 }
 
 // loadConfig loads Prometheus config from the given path.
-func loadConfig(path string) (*Config, []byte, error) {
-	data, err := fs.ReadFileOrHTTP(path)
+func loadConfig(path string) (cfg *Config, data []byte, err error) {
+	data, err = ioutil.ReadFile(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot read Prometheus config from %q: %w", path, err)
 	}
-	var c Config
-	dataNew, err := c.parseData(data, path)
-	if err != nil {
+	var cfgObj Config
+	if err := cfgObj.parse(data, path); err != nil {
 		return nil, nil, fmt.Errorf("cannot parse Prometheus config from %q: %w", path, err)
 	}
-	return &c, dataNew, nil
-}
-
-func loadScrapeConfigFiles(baseDir string, scrapeConfigFiles []string) ([]*ScrapeConfig, []byte, error) {
-	var scrapeConfigs []*ScrapeConfig
-	var scsData []byte
-	for _, filePath := range scrapeConfigFiles {
-		filePath := fs.GetFilepath(baseDir, filePath)
-		paths := []string{filePath}
-		if strings.Contains(filePath, "*") {
-			ps, err := filepath.Glob(filePath)
-			if err != nil {
-				return nil, nil, fmt.Errorf("invalid pattern %q: %w", filePath, err)
-			}
-			sort.Strings(ps)
-			paths = ps
-		}
-		for _, path := range paths {
-			data, err := fs.ReadFileOrHTTP(path)
-			if err != nil {
-				return nil, nil, fmt.Errorf("cannot load %q: %w", path, err)
-			}
-			data = envtemplate.Replace(data)
-			var scs []*ScrapeConfig
-			if err = yaml.UnmarshalStrict(data, &scs); err != nil {
-				return nil, nil, fmt.Errorf("cannot parse %q: %w", path, err)
-			}
-			scrapeConfigs = append(scrapeConfigs, scs...)
-			scsData = append(scsData, '\n')
-			scsData = append(scsData, data...)
-		}
-	}
-	return scrapeConfigs, scsData, nil
+	return &cfgObj, data, nil
 }
 
 // IsDryRun returns true if -promscrape.config.dryRun command-line flag is set
@@ -414,58 +218,35 @@ func IsDryRun() bool {
 	return *dryRun
 }
 
-func (cfg *Config) parseData(data []byte, path string) ([]byte, error) {
-	if err := cfg.unmarshal(data, *strictParse); err != nil {
-		return nil, fmt.Errorf("cannot unmarshal data: %w", err)
+func (cfg *Config) parse(data []byte, path string) error {
+	if err := unmarshalMaybeStrict(data, cfg); err != nil {
+		return fmt.Errorf("cannot unmarshal data: %w", err)
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("cannot obtain abs path for %q: %w", path, err)
+		return fmt.Errorf("cannot obtain abs path for %q: %w", path, err)
 	}
 	cfg.baseDir = filepath.Dir(absPath)
-
-	// Load cfg.ScrapeConfigFiles into c.ScrapeConfigs
-	scs, scsData, err := loadScrapeConfigFiles(cfg.baseDir, cfg.ScrapeConfigFiles)
-	if err != nil {
-		return nil, fmt.Errorf("cannot load `scrape_config_files` from %q: %w", path, err)
-	}
-	cfg.ScrapeConfigFiles = nil
-	cfg.ScrapeConfigs = append(cfg.ScrapeConfigs, scs...)
-	dataNew := append(data, scsData...)
-
-	// Check that all the scrape configs have unique JobName
-	m := make(map[string]struct{}, len(cfg.ScrapeConfigs))
-	for _, sc := range cfg.ScrapeConfigs {
-		jobName := sc.JobName
-		if _, ok := m[jobName]; ok {
-			return nil, fmt.Errorf("duplicate `job_name` in `scrape_configs` loaded from %q: %q", path, jobName)
-		}
-		m[jobName] = struct{}{}
-	}
-
-	// Initialize cfg.ScrapeConfigs
-	for i, sc := range cfg.ScrapeConfigs {
-		// Make a copy of sc in order to remove references to `data` memory.
-		// This should prevent from memory leaks on config reload.
-		sc = sc.clone()
-		cfg.ScrapeConfigs[i] = sc
-
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
 		swc, err := getScrapeWorkConfig(sc, cfg.baseDir, &cfg.Global)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse `scrape_config`: %w", err)
+			return fmt.Errorf("cannot parse `scrape_config` #%d: %w", i+1, err)
 		}
 		sc.swc = swc
 	}
-	return dataNew, nil
+	return nil
 }
 
-func (sc *ScrapeConfig) clone() *ScrapeConfig {
-	data := sc.marshalJSON()
-	var scCopy ScrapeConfig
-	if err := scCopy.unmarshalJSON(data); err != nil {
-		logger.Panicf("BUG: cannot unmarshal scrape config: %s", err)
+func unmarshalMaybeStrict(data []byte, dst interface{}) error {
+	data = envtemplate.Replace(data)
+	var err error
+	if *strictParse {
+		err = yaml.UnmarshalStrict(data, dst)
+	} else {
+		err = yaml.Unmarshal(data, dst)
 	}
-	return &scCopy
+	return err
 }
 
 func getSWSByJob(sws []*ScrapeWork) map[string][]*ScrapeWork {
@@ -476,303 +257,12 @@ func getSWSByJob(sws []*ScrapeWork) map[string][]*ScrapeWork {
 	return m
 }
 
-// getAzureSDScrapeWork returns `azure_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getAzureSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.AzureSDConfigs {
-			sdc := &sc.AzureSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "azure_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering azure targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getConsulSDScrapeWork returns `consul_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getConsulSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.ConsulSDConfigs {
-			sdc := &sc.ConsulSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "consul_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering consul targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getDigitalOceanDScrapeWork returns `digitalocean_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getDigitalOceanDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.DigitaloceanSDConfigs {
-			sdc := &sc.DigitaloceanSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "digitalocean_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering digitalocean targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getDNSSDScrapeWork returns `dns_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getDNSSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.DNSSDConfigs {
-			sdc := &sc.DNSSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "dns_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering dns targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getDockerSDScrapeWork returns `docker_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getDockerSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.DockerSDConfigs {
-			sdc := &sc.DockerSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "docker_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering docker targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getDockerSwarmSDScrapeWork returns `dockerswarm_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getDockerSwarmSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.DockerSwarmSDConfigs {
-			sdc := &sc.DockerSwarmSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "dockerswarm_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering dockerswarm targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getEC2SDScrapeWork returns `ec2_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getEC2SDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.EC2SDConfigs {
-			sdc := &sc.EC2SDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "ec2_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering ec2 targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getEurekaSDScrapeWork returns `eureka_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getEurekaSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.EurekaSDConfigs {
-			sdc := &sc.EurekaSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "eureka_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering eureka targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getFileSDScrapeWork returns `file_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getFileSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	// Create a map for the previous scrape work.
-	swsMapPrev := make(map[string][]*ScrapeWork)
-	for _, sw := range prev {
-		filepath := promrelabel.GetLabelValueByName(sw.Labels, "__vm_filepath")
-		if len(filepath) == 0 {
-			logger.Panicf("BUG: missing `__vm_filepath` label")
-		} else {
-			swsMapPrev[filepath] = append(swsMapPrev[filepath], sw)
-		}
-	}
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		for j := range sc.FileSDConfigs {
-			sdc := &sc.FileSDConfigs[j]
-			dst = sdc.appendScrapeWork(dst, swsMapPrev, cfg.baseDir, sc.swc)
-		}
-	}
-	return dst
-}
-
-// getGCESDScrapeWork returns `gce_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getGCESDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.GCESDConfigs {
-			sdc := &sc.GCESDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "gce_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering gce targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
-// getHTTPDScrapeWork returns `http_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getHTTPDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
-	swsPrevByJob := getSWSByJob(prev)
-	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
-		dstLen := len(dst)
-		ok := true
-		for j := range sc.HTTPSDConfigs {
-			sdc := &sc.HTTPSDConfigs[j]
-			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "http_sd_config")
-			if ok {
-				ok = okLocal
-			}
-		}
-		if ok {
-			continue
-		}
-		swsPrev := swsPrevByJob[sc.swc.jobName]
-		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering http targets for job %q, so preserving the previous targets", sc.swc.jobName)
-			dst = append(dst[:dstLen], swsPrev...)
-		}
-	}
-	return dst
-}
-
 // getKubernetesSDScrapeWork returns `kubernetes_sd_configs` ScrapeWork from cfg.
 func (cfg *Config) getKubernetesSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	swsPrevByJob := getSWSByJob(prev)
 	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
 		dstLen := len(dst)
 		ok := true
 		for j := range sc.KubernetesSDConfigs {
@@ -804,7 +294,8 @@ func (cfg *Config) getKubernetesSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 func (cfg *Config) getOpenStackSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	swsPrevByJob := getSWSByJob(prev)
 	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
 		dstLen := len(dst)
 		ok := true
 		for j := range sc.OpenStackSDConfigs {
@@ -827,17 +318,18 @@ func (cfg *Config) getOpenStackSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	return dst
 }
 
-// getYandexCloudSDScrapeWork returns `yandexcloud_sd_configs` ScrapeWork from cfg.
-func (cfg *Config) getYandexCloudSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+// getDockerSwarmSDScrapeWork returns `dockerswarm_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getDockerSwarmSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
 	swsPrevByJob := getSWSByJob(prev)
 	dst := make([]*ScrapeWork, 0, len(prev))
-	for _, sc := range cfg.ScrapeConfigs {
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
 		dstLen := len(dst)
 		ok := true
-		for j := range sc.YandexCloudSDConfigs {
-			sdc := &sc.YandexCloudSDConfigs[j]
+		for j := range sc.DockerSwarmSDConfigs {
+			sdc := &sc.DockerSwarmSDConfigs[j]
 			var okLocal bool
-			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "yandexcloud_sd_config")
+			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "dockerswarm_sd_config")
 			if ok {
 				ok = okLocal
 			}
@@ -847,8 +339,171 @@ func (cfg *Config) getYandexCloudSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork 
 		}
 		swsPrev := swsPrevByJob[sc.swc.jobName]
 		if len(swsPrev) > 0 {
-			logger.Errorf("there were errors when discovering yandexcloud targets for job %q, so preserving the previous targets", sc.swc.jobName)
+			logger.Errorf("there were errors when discovering dockerswarm targets for job %q, so preserving the previous targets", sc.swc.jobName)
 			dst = append(dst[:dstLen], swsPrev...)
+		}
+	}
+	return dst
+}
+
+// getConsulSDScrapeWork returns `consul_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getConsulSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	swsPrevByJob := getSWSByJob(prev)
+	dst := make([]*ScrapeWork, 0, len(prev))
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
+		dstLen := len(dst)
+		ok := true
+		for j := range sc.ConsulSDConfigs {
+			sdc := &sc.ConsulSDConfigs[j]
+			var okLocal bool
+			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "consul_sd_config")
+			if ok {
+				ok = okLocal
+			}
+		}
+		if ok {
+			continue
+		}
+		swsPrev := swsPrevByJob[sc.swc.jobName]
+		if len(swsPrev) > 0 {
+			logger.Errorf("there were errors when discovering consul targets for job %q, so preserving the previous targets", sc.swc.jobName)
+			dst = append(dst[:dstLen], swsPrev...)
+		}
+	}
+	return dst
+}
+
+// getEurekaSDScrapeWork returns `eureka_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getEurekaSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	swsPrevByJob := getSWSByJob(prev)
+	dst := make([]*ScrapeWork, 0, len(prev))
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
+		dstLen := len(dst)
+		ok := true
+		for j := range sc.EurekaSDConfigs {
+			sdc := &sc.EurekaSDConfigs[j]
+			var okLocal bool
+			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "eureka_sd_config")
+			if ok {
+				ok = okLocal
+			}
+		}
+		if ok {
+			continue
+		}
+		swsPrev := swsPrevByJob[sc.swc.jobName]
+		if len(swsPrev) > 0 {
+			logger.Errorf("there were errors when discovering eureka targets for job %q, so preserving the previous targets", sc.swc.jobName)
+			dst = append(dst[:dstLen], swsPrev...)
+		}
+	}
+	return dst
+}
+
+// getDNSSDScrapeWork returns `dns_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getDNSSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	swsPrevByJob := getSWSByJob(prev)
+	dst := make([]*ScrapeWork, 0, len(prev))
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
+		dstLen := len(dst)
+		ok := true
+		for j := range sc.DNSSDConfigs {
+			sdc := &sc.DNSSDConfigs[j]
+			var okLocal bool
+			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "dns_sd_config")
+			if ok {
+				ok = okLocal
+			}
+		}
+		if ok {
+			continue
+		}
+		swsPrev := swsPrevByJob[sc.swc.jobName]
+		if len(swsPrev) > 0 {
+			logger.Errorf("there were errors when discovering dns targets for job %q, so preserving the previous targets", sc.swc.jobName)
+			dst = append(dst[:dstLen], swsPrev...)
+		}
+	}
+	return dst
+}
+
+// getEC2SDScrapeWork returns `ec2_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getEC2SDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	swsPrevByJob := getSWSByJob(prev)
+	dst := make([]*ScrapeWork, 0, len(prev))
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
+		dstLen := len(dst)
+		ok := true
+		for j := range sc.EC2SDConfigs {
+			sdc := &sc.EC2SDConfigs[j]
+			var okLocal bool
+			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "ec2_sd_config")
+			if ok {
+				ok = okLocal
+			}
+		}
+		if ok {
+			continue
+		}
+		swsPrev := swsPrevByJob[sc.swc.jobName]
+		if len(swsPrev) > 0 {
+			logger.Errorf("there were errors when discovering ec2 targets for job %q, so preserving the previous targets", sc.swc.jobName)
+			dst = append(dst[:dstLen], swsPrev...)
+		}
+	}
+	return dst
+}
+
+// getGCESDScrapeWork returns `gce_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getGCESDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	swsPrevByJob := getSWSByJob(prev)
+	dst := make([]*ScrapeWork, 0, len(prev))
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
+		dstLen := len(dst)
+		ok := true
+		for j := range sc.GCESDConfigs {
+			sdc := &sc.GCESDConfigs[j]
+			var okLocal bool
+			dst, okLocal = appendSDScrapeWork(dst, sdc, cfg.baseDir, sc.swc, "gce_sd_config")
+			if ok {
+				ok = okLocal
+			}
+		}
+		if ok {
+			continue
+		}
+		swsPrev := swsPrevByJob[sc.swc.jobName]
+		if len(swsPrev) > 0 {
+			logger.Errorf("there were errors when discovering gce targets for job %q, so preserving the previous targets", sc.swc.jobName)
+			dst = append(dst[:dstLen], swsPrev...)
+		}
+	}
+	return dst
+}
+
+// getFileSDScrapeWork returns `file_sd_configs` ScrapeWork from cfg.
+func (cfg *Config) getFileSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork {
+	// Create a map for the previous scrape work.
+	swsMapPrev := make(map[string][]*ScrapeWork)
+	for _, sw := range prev {
+		filepath := promrelabel.GetLabelValueByName(sw.Labels, "__vm_filepath")
+		if len(filepath) == 0 {
+			logger.Panicf("BUG: missing `__vm_filepath` label")
+		} else {
+			swsMapPrev[filepath] = append(swsMapPrev[filepath], sw)
+		}
+	}
+	dst := make([]*ScrapeWork, 0, len(prev))
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
+		for j := range sc.FileSDConfigs {
+			sdc := &sc.FileSDConfigs[j]
+			dst = sdc.appendScrapeWork(dst, swsMapPrev, cfg.baseDir, sc.swc)
 		}
 	}
 	return dst
@@ -857,7 +512,8 @@ func (cfg *Config) getYandexCloudSDScrapeWork(prev []*ScrapeWork) []*ScrapeWork 
 // getStaticScrapeWork returns `static_configs` ScrapeWork from from cfg.
 func (cfg *Config) getStaticScrapeWork() []*ScrapeWork {
 	var dst []*ScrapeWork
-	for _, sc := range cfg.ScrapeConfigs {
+	for i := range cfg.ScrapeConfigs {
+		sc := &cfg.ScrapeConfigs[i]
 		for j := range sc.StaticConfigs {
 			stc := &sc.StaticConfigs[j]
 			dst = stc.appendScrapeWork(dst, sc.swc, nil)
@@ -871,31 +527,22 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 	if jobName == "" {
 		return nil, fmt.Errorf("missing `job_name` field in `scrape_config`")
 	}
-	scrapeInterval := sc.ScrapeInterval.Duration()
+	scrapeInterval := sc.ScrapeInterval
 	if scrapeInterval <= 0 {
-		scrapeInterval = globalCfg.ScrapeInterval.Duration()
+		scrapeInterval = globalCfg.ScrapeInterval
 		if scrapeInterval <= 0 {
 			scrapeInterval = defaultScrapeInterval
 		}
 	}
-	scrapeTimeout := sc.ScrapeTimeout.Duration()
+	scrapeTimeout := sc.ScrapeTimeout
 	if scrapeTimeout <= 0 {
-		scrapeTimeout = globalCfg.ScrapeTimeout.Duration()
+		scrapeTimeout = globalCfg.ScrapeTimeout
 		if scrapeTimeout <= 0 {
 			scrapeTimeout = defaultScrapeTimeout
 		}
 	}
-	if scrapeTimeout > scrapeInterval {
-		// Limit the `scrape_timeout` with `scrape_interval` like Prometheus does.
-		// This guarantees that the scraper can miss only a single scrape if the target sometimes responds slowly.
-		// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1281#issuecomment-840538907
-		scrapeTimeout = scrapeInterval
-	}
 	honorLabels := sc.HonorLabels
-	honorTimestamps := true
-	if sc.HonorTimestamps != nil {
-		honorTimestamps = *sc.HonorTimestamps
-	}
+	honorTimestamps := sc.HonorTimestamps
 	denyRedirects := false
 	if sc.FollowRedirects != nil {
 		denyRedirects = !*sc.FollowRedirects
@@ -904,7 +551,7 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 	if metricsPath == "" {
 		metricsPath = "/metrics"
 	}
-	scheme := strings.ToLower(sc.Scheme)
+	scheme := sc.Scheme
 	if scheme == "" {
 		scheme = "http"
 	}
@@ -920,25 +567,17 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse proxy auth config for `job_name` %q: %w", jobName, err)
 	}
-	relabelConfigs, err := promrelabel.ParseRelabelConfigs(sc.RelabelConfigs, sc.RelabelDebug)
+	relabelConfigs, err := promrelabel.ParseRelabelConfigs(sc.RelabelConfigs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse `relabel_configs` for `job_name` %q: %w", jobName, err)
 	}
-	metricRelabelConfigs, err := promrelabel.ParseRelabelConfigs(sc.MetricRelabelConfigs, sc.MetricRelabelDebug)
+	metricRelabelConfigs, err := promrelabel.ParseRelabelConfigs(sc.MetricRelabelConfigs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse `metric_relabel_configs` for `job_name` %q: %w", jobName, err)
 	}
-	if (*streamParse || sc.StreamParse) && sc.SampleLimit > 0 {
-		return nil, fmt.Errorf("cannot use stream parsing mode when `sample_limit` is set for `job_name` %q", jobName)
-	}
-	if (*streamParse || sc.StreamParse) && sc.SeriesLimit > 0 {
-		return nil, fmt.Errorf("cannot use stream parsing mode when `series_limit` is set for `job_name` %q", jobName)
-	}
 	swc := &scrapeWorkConfig{
 		scrapeInterval:       scrapeInterval,
-		scrapeIntervalString: scrapeInterval.String(),
 		scrapeTimeout:        scrapeTimeout,
-		scrapeTimeoutString:  scrapeTimeout.String(),
 		jobName:              jobName,
 		metricsPath:          metricsPath,
 		scheme:               scheme,
@@ -956,23 +595,20 @@ func getScrapeWorkConfig(sc *ScrapeConfig, baseDir string, globalCfg *GlobalConf
 		disableCompression:   sc.DisableCompression,
 		disableKeepAlive:     sc.DisableKeepAlive,
 		streamParse:          sc.StreamParse,
-		scrapeAlignInterval:  sc.ScrapeAlignInterval.Duration(),
-		scrapeOffset:         sc.ScrapeOffset.Duration(),
-		seriesLimit:          sc.SeriesLimit,
+		scrapeAlignInterval:  sc.ScrapeAlignInterval,
+		scrapeOffset:         sc.ScrapeOffset,
 	}
 	return swc, nil
 }
 
 type scrapeWorkConfig struct {
 	scrapeInterval       time.Duration
-	scrapeIntervalString string
 	scrapeTimeout        time.Duration
-	scrapeTimeoutString  string
 	jobName              string
 	metricsPath          string
 	scheme               string
 	params               map[string][]string
-	proxyURL             *proxy.URL
+	proxyURL             proxy.URL
 	proxyAuthConfig      *promauth.Config
 	authConfig           *promauth.Config
 	honorLabels          bool
@@ -987,7 +623,6 @@ type scrapeWorkConfig struct {
 	streamParse          bool
 	scrapeAlignInterval  time.Duration
 	scrapeOffset         time.Duration
-	seriesLimit          int
 }
 
 type targetLabelsGetter interface {
@@ -1048,7 +683,7 @@ func appendScrapeWorkForTargetLabels(dst []*ScrapeWork, swc *scrapeWorkConfig, t
 
 func (sdc *FileSDConfig) appendScrapeWork(dst []*ScrapeWork, swsMapPrev map[string][]*ScrapeWork, baseDir string, swc *scrapeWorkConfig) []*ScrapeWork {
 	for _, file := range sdc.Files {
-		pathPattern := fs.GetFilepath(baseDir, file)
+		pathPattern := getFilepath(baseDir, file)
 		paths := []string{pathPattern}
 		if strings.Contains(pathPattern, "*") {
 			var err error
@@ -1111,14 +746,11 @@ func (stc *StaticConfig) appendScrapeWork(dst []*ScrapeWork, swc *scrapeWorkConf
 	return dst
 }
 
-func appendScrapeWorkKey(dst []byte, labels []prompbmarshal.Label) []byte {
-	for _, label := range labels {
-		// Do not use strconv.AppendQuote, since it is slow according to CPU profile.
-		dst = append(dst, label.Name...)
-		dst = append(dst, '=')
-		dst = append(dst, label.Value...)
-		dst = append(dst, ',')
-	}
+func appendScrapeWorkKey(dst []byte, target string, extraLabels, metaLabels map[string]string) []byte {
+	dst = append(dst, target...)
+	dst = append(dst, ',')
+	dst = appendSortedKeyValuePairs(dst, extraLabels)
+	dst = appendSortedKeyValuePairs(dst, metaLabels)
 	return dst
 }
 
@@ -1136,72 +768,59 @@ func needSkipScrapeWork(key string, membersCount, replicasCount, memberNum int) 
 			return false
 		}
 		idx++
-		if idx >= membersCount {
+		if idx >= replicasCount {
 			idx = 0
 		}
 	}
 	return true
 }
 
-type labelsContext struct {
-	labels []prompbmarshal.Label
-}
-
-func getLabelsContext() *labelsContext {
-	v := labelsContextPool.Get()
-	if v == nil {
-		return &labelsContext{}
+func appendSortedKeyValuePairs(dst []byte, m map[string]string) []byte {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-	return v.(*labelsContext)
-}
-
-func putLabelsContext(lctx *labelsContext) {
-	labels := lctx.labels
-	for i := range labels {
-		labels[i].Name = ""
-		labels[i].Value = ""
+	sort.Strings(keys)
+	for _, k := range keys {
+		// Do not use strconv.AppendQuote, since it is slow according to CPU profile.
+		dst = append(dst, k...)
+		dst = append(dst, '=')
+		dst = append(dst, m[k]...)
+		dst = append(dst, ',')
 	}
-	lctx.labels = lctx.labels[:0]
-	labelsContextPool.Put(lctx)
+	dst = append(dst, '\n')
+	return dst
 }
-
-var labelsContextPool sync.Pool
 
 var scrapeWorkKeyBufPool bytesutil.ByteBufferPool
 
 func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabels map[string]string) (*ScrapeWork, error) {
-	lctx := getLabelsContext()
-	lctx.labels = mergeLabels(lctx.labels[:0], swc, target, extraLabels, metaLabels)
-	var originalLabels []prompbmarshal.Label
-	if !*dropOriginalLabels {
-		originalLabels = append([]prompbmarshal.Label{}, lctx.labels...)
-	}
-	lctx.labels = swc.relabelConfigs.Apply(lctx.labels, 0, false)
-	lctx.labels = promrelabel.RemoveMetaLabels(lctx.labels[:0], lctx.labels)
-	// Remove references to already deleted labels, so GC could clean strings for label name and label value past len(labels).
-	// This should reduce memory usage when relabeling creates big number of temporary labels with long names and/or values.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825 for details.
-	labels := append([]prompbmarshal.Label{}, lctx.labels...)
-	putLabelsContext(lctx)
-
 	// Verify whether the scrape work must be skipped because of `-promscrape.cluster.*` configs.
-	// Perform the verification on labels after the relabeling in order to guarantee that targets with the same set of labels
-	// go to the same vmagent shard.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1687#issuecomment-940629495
 	if *clusterMembersCount > 1 {
 		bb := scrapeWorkKeyBufPool.Get()
-		bb.B = appendScrapeWorkKey(bb.B[:0], labels)
-		needSkip := needSkipScrapeWork(bytesutil.ToUnsafeString(bb.B), *clusterMembersCount, *clusterReplicationFactor, clusterMemberID)
+		bb.B = appendScrapeWorkKey(bb.B[:0], target, extraLabels, metaLabels)
+		needSkip := needSkipScrapeWork(bytesutil.ToUnsafeString(bb.B), *clusterMembersCount, *clusterReplicationFactor, *clusterMemberNum)
 		scrapeWorkKeyBufPool.Put(bb)
 		if needSkip {
 			return nil, nil
 		}
 	}
+
+	labels := mergeLabels(swc.jobName, swc.scheme, target, swc.metricsPath, extraLabels, swc.externalLabels, metaLabels, swc.params)
+	var originalLabels []prompbmarshal.Label
 	if !*dropOriginalLabels {
+		originalLabels = append([]prompbmarshal.Label{}, labels...)
 		promrelabel.SortLabels(originalLabels)
 		// Reduce memory usage by interning all the strings in originalLabels.
 		internLabelStrings(originalLabels)
 	}
+	labels = swc.relabelConfigs.Apply(labels, 0, false)
+	labels = promrelabel.RemoveMetaLabels(labels[:0], labels)
+	// Remove references to already deleted labels, so GC could clean strings for label name and label value past len(labels).
+	// This should reduce memory usage when relabeling creates big number of temporary labels with long names and/or values.
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/825 for details.
+	labels = append([]prompbmarshal.Label{}, labels...)
+
 	if len(labels) == 0 {
 		// Drop target without labels.
 		droppedTargetsMap.Register(originalLabels)
@@ -1223,22 +842,11 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		droppedTargetsMap.Register(originalLabels)
 		return nil, nil
 	}
-	addressRelabeled = addMissingPort(addressRelabeled, schemeRelabeled == "https")
+	addressRelabeled = addMissingPort(schemeRelabeled, addressRelabeled)
 	metricsPathRelabeled := promrelabel.GetLabelValueByName(labels, "__metrics_path__")
 	if metricsPathRelabeled == "" {
 		metricsPathRelabeled = "/metrics"
 	}
-
-	var at *auth.Token
-	tenantID := promrelabel.GetLabelValueByName(labels, "__tenant_id__")
-	if tenantID != "" {
-		newToken, err := auth.NewToken(tenantID)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse __tenant_id__=%q for job=%s, err: %w", tenantID, swc.jobName, err)
-		}
-		at = newToken
-	}
-
 	if !strings.HasPrefix(metricsPathRelabeled, "/") {
 		metricsPathRelabeled = "/" + metricsPathRelabeled
 	}
@@ -1261,49 +869,12 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		})
 		promrelabel.SortLabels(labels)
 	}
-	// Read __scrape_interval__ and __scrape_timeout__ from labels.
-	scrapeInterval := swc.scrapeInterval
-	if s := promrelabel.GetLabelValueByName(labels, "__scrape_interval__"); len(s) > 0 {
-		d, err := promutils.ParseDuration(s)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse __scrape_interval__=%q: %w", s, err)
-		}
-		scrapeInterval = d
-	}
-	scrapeTimeout := swc.scrapeTimeout
-	if s := promrelabel.GetLabelValueByName(labels, "__scrape_timeout__"); len(s) > 0 {
-		d, err := promutils.ParseDuration(s)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse __scrape_timeout__=%q: %w", s, err)
-		}
-		scrapeTimeout = d
-	}
-	// Read series_limit option from __series_limit__ label.
-	// See https://docs.victoriametrics.com/vmagent.html#cardinality-limiter
-	seriesLimit := swc.seriesLimit
-	if s := promrelabel.GetLabelValueByName(labels, "__series_limit__"); len(s) > 0 {
-		n, err := strconv.Atoi(s)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse __series_limit__=%q: %w", s, err)
-		}
-		seriesLimit = n
-	}
-	// Read stream_parse option from __stream_parse__ label.
-	// See https://docs.victoriametrics.com/vmagent.html#stream-parsing-mode
-	streamParse := swc.streamParse
-	if s := promrelabel.GetLabelValueByName(labels, "__stream_parse__"); len(s) > 0 {
-		b, err := strconv.ParseBool(s)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse __stream_parse__=%q: %w", s, err)
-		}
-		streamParse = b
-	}
 	// Reduce memory usage by interning all the strings in labels.
 	internLabelStrings(labels)
 	sw := &ScrapeWork{
 		ScrapeURL:            scrapeURL,
-		ScrapeInterval:       scrapeInterval,
-		ScrapeTimeout:        scrapeTimeout,
+		ScrapeInterval:       swc.scrapeInterval,
+		ScrapeTimeout:        swc.scrapeTimeout,
 		HonorLabels:          swc.honorLabels,
 		HonorTimestamps:      swc.honorTimestamps,
 		DenyRedirects:        swc.denyRedirects,
@@ -1316,11 +887,9 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		SampleLimit:          swc.sampleLimit,
 		DisableCompression:   swc.disableCompression,
 		DisableKeepAlive:     swc.disableKeepAlive,
-		StreamParse:          streamParse,
+		StreamParse:          swc.streamParse,
 		ScrapeAlignInterval:  swc.scrapeAlignInterval,
 		ScrapeOffset:         swc.scrapeOffset,
-		SeriesLimit:          seriesLimit,
-		AuthToken:            at,
 
 		jobNameOriginal: swc.jobName,
 	}
@@ -1330,10 +899,31 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 func internLabelStrings(labels []prompbmarshal.Label) {
 	for i := range labels {
 		label := &labels[i]
-		label.Name = discoveryutils.InternString(label.Name)
-		label.Value = discoveryutils.InternString(label.Value)
+		label.Name = internString(label.Name)
+		label.Value = internString(label.Value)
 	}
 }
+
+func internString(s string) string {
+	internStringsMapLock.Lock()
+	defer internStringsMapLock.Unlock()
+
+	if sInterned, ok := internStringsMap[s]; ok {
+		return sInterned
+	}
+	// Make a new copy for s in order to remove references from possible bigger string s refers to.
+	sCopy := string(append([]byte{}, s...))
+	internStringsMap[sCopy] = sCopy
+	if len(internStringsMap) > 100e3 {
+		internStringsMap = make(map[string]string, 100e3)
+	}
+	return sCopy
+}
+
+var (
+	internStringsMapLock sync.Mutex
+	internStringsMap     = make(map[string]string, 100e3)
+)
 
 func getParamsFromLabels(labels []prompbmarshal.Label, paramsOrig map[string][]string) map[string][]string {
 	// See https://www.robustperception.io/life-of-a-label
@@ -1353,77 +943,57 @@ func getParamsFromLabels(labels []prompbmarshal.Label, paramsOrig map[string][]s
 	return m
 }
 
-func mergeLabels(dst []prompbmarshal.Label, swc *scrapeWorkConfig, target string, extraLabels, metaLabels map[string]string) []prompbmarshal.Label {
-	if len(dst) > 0 {
-		logger.Panicf("BUG: len(dst) must be 0; got %d", len(dst))
-	}
+func mergeLabels(job, scheme, target, metricsPath string, extraLabels, externalLabels, metaLabels map[string]string, params map[string][]string) []prompbmarshal.Label {
 	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config
-	for k, v := range swc.externalLabels {
-		dst = appendLabel(dst, k, v)
+	m := make(map[string]string, 4+len(externalLabels)+len(params)+len(extraLabels)+len(metaLabels))
+	for k, v := range externalLabels {
+		m[k] = v
 	}
-	dst = appendLabel(dst, "job", swc.jobName)
-	dst = appendLabel(dst, "__address__", target)
-	dst = appendLabel(dst, "__scheme__", swc.scheme)
-	dst = appendLabel(dst, "__metrics_path__", swc.metricsPath)
-	dst = appendLabel(dst, "__scrape_interval__", swc.scrapeIntervalString)
-	dst = appendLabel(dst, "__scrape_timeout__", swc.scrapeTimeoutString)
-	for k, args := range swc.params {
+	m["job"] = job
+	m["__address__"] = target
+	m["__scheme__"] = scheme
+	m["__metrics_path__"] = metricsPath
+	for k, args := range params {
 		if len(args) == 0 {
 			continue
 		}
 		k = "__param_" + k
 		v := args[0]
-		dst = appendLabel(dst, k, v)
+		m[k] = v
 	}
 	for k, v := range extraLabels {
-		dst = appendLabel(dst, k, v)
+		m[k] = v
 	}
 	for k, v := range metaLabels {
-		dst = appendLabel(dst, k, v)
+		m[k] = v
 	}
-	if len(dst) < 2 {
-		return dst
+	result := make([]prompbmarshal.Label, 0, len(m))
+	for k, v := range m {
+		result = append(result, prompbmarshal.Label{
+			Name:  k,
+			Value: v,
+		})
 	}
-	// Remove duplicate labels if any.
-	// Stable sorting is needed in order to preserve the order for labels with identical names.
-	// This is needed in order to remove labels with duplicate names other than the last one.
-	promrelabel.SortLabelsStable(dst)
-	prevName := dst[0].Name
-	hasDuplicateLabels := false
-	for _, label := range dst[1:] {
-		if label.Name == prevName {
-			hasDuplicateLabels = true
-			break
-		}
-		prevName = label.Name
-	}
-	if !hasDuplicateLabels {
-		return dst
-	}
-	prevName = dst[0].Name
-	tmp := dst[:1]
-	for _, label := range dst[1:] {
-		if label.Name == prevName {
-			tmp[len(tmp)-1] = label
-		} else {
-			tmp = append(tmp, label)
-			prevName = label.Name
-		}
-	}
-	tail := dst[len(tmp):]
-	for i := range tail {
-		label := &tail[i]
-		label.Name = ""
-		label.Value = ""
-	}
-	return tmp
+	return result
 }
 
-func appendLabel(dst []prompbmarshal.Label, name, value string) []prompbmarshal.Label {
-	return append(dst, prompbmarshal.Label{
-		Name:  name,
-		Value: value,
-	})
+func getFilepath(baseDir, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(baseDir, path)
+}
+
+func addMissingPort(scheme, target string) string {
+	if strings.Contains(target, ":") {
+		return target
+	}
+	if scheme == "https" {
+		target += ":443"
+	} else {
+		target += ":80"
+	}
+	return target
 }
 
 const (

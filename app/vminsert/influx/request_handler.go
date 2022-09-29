@@ -20,10 +20,9 @@ import (
 )
 
 var (
-	measurementFieldSeparator = flag.String("influxMeasurementFieldSeparator", "_", "Separator for '{measurement}{separator}{field_name}' metric name when inserted via InfluxDB line protocol")
-	skipSingleField           = flag.Bool("influxSkipSingleField", false, "Uses '{measurement}' instead of '{measurement}{separator}{field_name}' for metic name if InfluxDB line contains only a single field")
+	measurementFieldSeparator = flag.String("influxMeasurementFieldSeparator", "_", "Separator for '{measurement}{separator}{field_name}' metric name when inserted via Influx line protocol")
+	skipSingleField           = flag.Bool("influxSkipSingleField", false, "Uses '{measurement}' instead of '{measurement}{separator}{field_name}' for metic name if Influx line contains only a single field")
 	skipMeasurement           = flag.Bool("influxSkipMeasurement", false, "Uses '{field_name}' as a metric name while ignoring '{measurement}' and '-influxMeasurementFieldSeparator'")
-	dbLabel                   = flag.String("influxDBLabel", "db", "Default label for the DB name sent over '?db={db_name}' query parameter")
 )
 
 var (
@@ -81,13 +80,13 @@ func insertRows(db string, rows []parser.Row, extraLabels []prompbmarshal.Label)
 		hasDBKey := false
 		for j := range r.Tags {
 			tag := &r.Tags[j]
-			if tag.Key == *dbLabel {
+			if tag.Key == "db" {
 				hasDBKey = true
 			}
 			ic.AddLabel(tag.Key, tag.Value)
 		}
 		if !hasDBKey {
-			ic.AddLabel(*dbLabel, db)
+			ic.AddLabel("db", db)
 		}
 		for j := range extraLabels {
 			label := &extraLabels[j]

@@ -3,7 +3,7 @@ package remotewrite
 import (
 	"context"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
@@ -80,23 +80,7 @@ func (rw *rwServer) handler(w http.ResponseWriter, r *http.Request) {
 		rw.err(w, fmt.Errorf("bad method %q", r.Method))
 		return
 	}
-
-	h := r.Header.Get("Content-Encoding")
-	if h != "snappy" {
-		rw.err(w, fmt.Errorf("header read error: Content-Encoding is not snappy (%q)", h))
-	}
-
-	h = r.Header.Get("Content-Type")
-	if h != "application/x-protobuf" {
-		rw.err(w, fmt.Errorf("header read error: Content-Type is not x-protobuf (%q)", h))
-	}
-
-	h = r.Header.Get("X-Prometheus-Remote-Write-Version")
-	if h != "0.1.0" {
-		rw.err(w, fmt.Errorf("header read error: X-Prometheus-Remote-Write-Version is not 0.1.0 (%q)", h))
-	}
-
-	data, err := io.ReadAll(r.Body)
+	data, err := ioutil.ReadAll(r.Body)
 	if err != nil {
 		rw.err(w, fmt.Errorf("body read err: %w", err))
 		return

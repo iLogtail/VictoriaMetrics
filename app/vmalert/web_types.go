@@ -1,132 +1,57 @@
 package main
 
 import (
-	"fmt"
 	"time"
 )
 
-// APIAlert represents a notifier.AlertingRule ruleState
+// APIAlert represents an notifier.AlertingRule state
 // for WEB view
-// https://github.com/prometheus/compliance/blob/main/alert_generator/specification.md#get-apiv1rules
 type APIAlert struct {
-	State       string            `json:"ruleState"`
+	ID          string            `json:"id"`
 	Name        string            `json:"name"`
+	GroupID     string            `json:"group_id"`
+	Expression  string            `json:"expression"`
+	State       string            `json:"state"`
 	Value       string            `json:"value"`
-	Labels      map[string]string `json:"labels,omitempty"`
+	Labels      map[string]string `json:"labels"`
 	Annotations map[string]string `json:"annotations"`
 	ActiveAt    time.Time         `json:"activeAt"`
-
-	// Additional fields
-
-	// ID is an unique Alert's ID within a group
-	ID string `json:"id"`
-	// RuleID is an unique Rule's ID within a group
-	RuleID string `json:"rule_id"`
-	// GroupID is an unique Group's ID
-	GroupID string `json:"group_id"`
-	// Expression contains the PromQL/MetricsQL expression
-	// for Rule's evaluation
-	Expression string `json:"expression"`
-	// SourceLink contains a link to a system which should show
-	// why Alert was generated
-	SourceLink string `json:"source"`
-	// Restored shows whether Alert's ruleState was restored on restart
-	Restored bool `json:"restored"`
-}
-
-// WebLink returns a link to the alert which can be used in UI.
-func (aa *APIAlert) WebLink() string {
-	return fmt.Sprintf("alert?%s=%s&%s=%s",
-		paramGroupID, aa.GroupID, paramAlertID, aa.ID)
-}
-
-// APILink returns a link to the alert's JSON representation.
-func (aa *APIAlert) APILink() string {
-	return fmt.Sprintf("api/v1/alert?%s=%s&%s=%s",
-		paramGroupID, aa.GroupID, paramAlertID, aa.ID)
 }
 
 // APIGroup represents Group for WEB view
-// https://github.com/prometheus/compliance/blob/main/alert_generator/specification.md#get-apiv1rules
 type APIGroup struct {
-	// Name is the group name as present in the config
-	Name string `json:"name"`
-	// Rules contains both recording and alerting rules
-	Rules []APIRule `json:"rules"`
-	// Interval is the Group's evaluation interval in float seconds as present in the file.
-	Interval float64 `json:"interval"`
-	// LastEvaluation is the timestamp of the last time the Group was executed
-	LastEvaluation time.Time `json:"lastEvaluation"`
-
-	// Additional fields
-
-	// Type shows the datasource type (prometheus or graphite) of the Group
-	Type string `json:"type"`
-	// ID is a unique Group ID
-	ID string `json:"id"`
-	// File contains a path to the file with Group's config
-	File string `json:"file"`
-	// Concurrency shows how many rules may be evaluated simultaneously
-	Concurrency int `json:"concurrency"`
-	// Params contains HTTP URL parameters added to each Rule's request
-	Params []string `json:"params,omitempty"`
-	// Headers contains HTTP headers added to each Rule's request
-	Headers []string `json:"headers,omitempty"`
-	// Labels is a set of label value pairs, that will be added to every rule.
-	Labels map[string]string `json:"labels,omitempty"`
+	Name           string             `json:"name"`
+	Type           string             `json:"type"`
+	ID             string             `json:"id"`
+	File           string             `json:"file"`
+	Interval       string             `json:"interval"`
+	Concurrency    int                `json:"concurrency"`
+	AlertingRules  []APIAlertingRule  `json:"alerting_rules"`
+	RecordingRules []APIRecordingRule `json:"recording_rules"`
 }
 
-// GroupAlerts represents a group of alerts for WEB view
-type GroupAlerts struct {
-	Group  APIGroup
-	Alerts []*APIAlert
+// APIAlertingRule represents AlertingRule for WEB view
+type APIAlertingRule struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Type        string            `json:"type"`
+	GroupID     string            `json:"group_id"`
+	Expression  string            `json:"expression"`
+	For         string            `json:"for"`
+	LastError   string            `json:"last_error"`
+	LastExec    time.Time         `json:"last_exec"`
+	Labels      map[string]string `json:"labels"`
+	Annotations map[string]string `json:"annotations"`
 }
 
-// APIRule represents a Rule for WEB view
-// see https://github.com/prometheus/compliance/blob/main/alert_generator/specification.md#get-apiv1rules
-type APIRule struct {
-	// State must be one of these under following scenarios
-	//  "pending": at least 1 alert in the rule in pending ruleState and no other alert in firing ruleState.
-	//  "firing": at least 1 alert in the rule in firing ruleState.
-	//  "inactive": no alert in the rule in firing or pending ruleState.
-	State string `json:"ruleState"`
-	Name  string `json:"name"`
-	// Query represents Rule's `expression` field
-	Query string `json:"query"`
-	// Duration represents Rule's `for` field
-	Duration    float64           `json:"duration"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Annotations map[string]string `json:"annotations,omitempty"`
-	// LastError contains the error faced while executing the rule.
-	LastError string `json:"lastError"`
-	// EvaluationTime is the time taken to completely evaluate the rule in float seconds.
-	EvaluationTime float64 `json:"evaluationTime"`
-	// LastEvaluation is the timestamp of the last time the rule was executed
-	LastEvaluation time.Time `json:"lastEvaluation"`
-	// Alerts  is the list of all the alerts in this rule that are currently pending or firing
-	Alerts []*APIAlert `json:"alerts,omitempty"`
-	// Health is the health of rule evaluation.
-	// It MUST be one of "ok", "err", "unknown"
-	Health string `json:"health"`
-	// Type of the rule: recording or alerting
-	Type string `json:"type"`
-
-	// Additional fields
-
-	// Type of the rule: recording or alerting
-	DatasourceType string `json:"datasourceType"`
-	LastSamples    int    `json:"lastSamples"`
-	// ID is a unique Alert's ID within a group
-	ID string `json:"id"`
-	// GroupID is an unique Group's ID
-	GroupID string `json:"group_id"`
-
-	// TODO:
-	Updates []ruleStateEntry `json:"updates"`
-}
-
-// WebLink returns a link to the alert which can be used in UI.
-func (ar APIRule) WebLink() string {
-	return fmt.Sprintf("rule?%s=%s&%s=%s",
-		paramGroupID, ar.GroupID, paramRuleID, ar.ID)
+// APIRecordingRule represents RecordingRule for WEB view
+type APIRecordingRule struct {
+	ID         string            `json:"id"`
+	Name       string            `json:"name"`
+	Type       string            `json:"type"`
+	GroupID    string            `json:"group_id"`
+	Expression string            `json:"expression"`
+	LastError  string            `json:"last_error"`
+	LastExec   time.Time         `json:"last_exec"`
+	Labels     map[string]string `json:"labels"`
 }

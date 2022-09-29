@@ -3,37 +3,29 @@ package remotewrite
 import (
 	"bytes"
 	"context"
-	"flag"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net/http"
-	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang/snappy"
-
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/metrics"
-)
-
-var (
-	disablePathAppend = flag.Bool("remoteWrite.disablePathAppend", false, "Whether to disable automatic appending of '/api/v1/write' path to the configured -remoteWrite.url.")
+	"github.com/golang/snappy"
 )
 
 // Client is an asynchronous HTTP client for writing
 // timeseries via remote write protocol.
 type Client struct {
-	addr          string
-	c             *http.Client
-	authCfg       *promauth.Config
-	input         chan prompbmarshal.TimeSeries
-	flushInterval time.Duration
-	maxBatchSize  int
-	maxQueueSize  int
+	addr           string
+	c              *http.Client
+	input          chan prompbmarshal.TimeSeries
+	baUser, baPass string
+	flushInterval  time.Duration
+	maxBatchSize   int
+	maxQueueSize   int
 
 	wg     sync.WaitGroup
 	doneCh chan struct{}
@@ -42,8 +34,10 @@ type Client struct {
 // Config is config for remote write.
 type Config struct {
 	// Addr of remote storage
-	Addr    string
-	AuthCfg *promauth.Config
+	Addr string
+
+	BasicAuthUser string
+	BasicAuthPass string
 
 	// Concurrency defines number of readers that
 	// concurrently read from the queue and flush data
@@ -62,8 +56,6 @@ type Config struct {
 	WriteTimeout time.Duration
 	// Transport will be used by the underlying http.Client
 	Transport *http.Transport
-	// DisablePathAppend can be used to not automatically append '/api/v1/write' to the remote write url
-	DisablePathAppend bool
 }
 
 const (
@@ -73,6 +65,8 @@ const (
 	defaultFlushInterval = 5 * time.Second
 	defaultWriteTimeout  = 30 * time.Second
 )
+
+const writePath = "/api/v1/write"
 
 // NewClient returns asynchronous client for
 // writing timeseries via remotewrite protocol.
@@ -95,24 +89,24 @@ func NewClient(ctx context.Context, cfg Config) (*Client, error) {
 	if cfg.Transport == nil {
 		cfg.Transport = http.DefaultTransport.(*http.Transport).Clone()
 	}
-	cc := defaultConcurrency
-	if cfg.Concurrency > 0 {
-		cc = cfg.Concurrency
-	}
 	c := &Client{
 		c: &http.Client{
 			Timeout:   cfg.WriteTimeout,
 			Transport: cfg.Transport,
 		},
 		addr:          strings.TrimSuffix(cfg.Addr, "/"),
-		authCfg:       cfg.AuthCfg,
+		baUser:        cfg.BasicAuthUser,
+		baPass:        cfg.BasicAuthPass,
 		flushInterval: cfg.FlushInterval,
 		maxBatchSize:  cfg.MaxBatchSize,
 		maxQueueSize:  cfg.MaxQueueSize,
 		doneCh:        make(chan struct{}),
 		input:         make(chan prompbmarshal.TimeSeries, cfg.MaxQueueSize),
 	}
-
+	cc := defaultConcurrency
+	if cfg.Concurrency > 0 {
+		cc = cfg.Concurrency
+	}
 	for i := 0; i < cc; i++ {
 		c.run(ctx)
 	}
@@ -185,11 +179,10 @@ func (c *Client) run(ctx context.Context) {
 }
 
 var (
-	sentRows            = metrics.NewCounter(`vmalert_remotewrite_sent_rows_total`)
-	sentBytes           = metrics.NewCounter(`vmalert_remotewrite_sent_bytes_total`)
-	droppedRows         = metrics.NewCounter(`vmalert_remotewrite_dropped_rows_total`)
-	droppedBytes        = metrics.NewCounter(`vmalert_remotewrite_dropped_bytes_total`)
-	bufferFlushDuration = metrics.NewHistogram(`vmalert_remotewrite_flush_duration_seconds`)
+	sentRows     = metrics.NewCounter(`vmalert_remotewrite_sent_rows_total`)
+	sentBytes    = metrics.NewCounter(`vmalert_remotewrite_sent_bytes_total`)
+	droppedRows  = metrics.NewCounter(`vmalert_remotewrite_dropped_rows_total`)
+	droppedBytes = metrics.NewCounter(`vmalert_remotewrite_dropped_bytes_total`)
 )
 
 // flush is a blocking function that marshals WriteRequest and sends
@@ -200,7 +193,6 @@ func (c *Client) flush(ctx context.Context, wr *prompbmarshal.WriteRequest) {
 		return
 	}
 	defer prompbmarshal.ResetWriteRequest(wr)
-	defer bufferFlushDuration.UpdateDuration(time.Now())
 
 	data, err := wr.Marshal()
 	if err != nil {
@@ -226,7 +218,7 @@ func (c *Client) flush(ctx context.Context, wr *prompbmarshal.WriteRequest) {
 
 	droppedRows.Add(len(wr.Timeseries))
 	droppedBytes.Add(len(b))
-	logger.Errorf("all %d attempts to send request failed - dropping %d time series",
+	logger.Errorf("all %d attempts to send request failed - dropping %d timeseries",
 		attempts, len(wr.Timeseries))
 }
 
@@ -236,30 +228,20 @@ func (c *Client) send(ctx context.Context, data []byte) error {
 	if err != nil {
 		return fmt.Errorf("failed to create new HTTP request: %w", err)
 	}
-
-	// RFC standard compliant headers
-	req.Header.Set("Content-Encoding", "snappy")
-	req.Header.Set("Content-Type", "application/x-protobuf")
-
-	// Prometheus compliant headers
-	req.Header.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
-
-	if c.authCfg != nil {
-		c.authCfg.SetHeaders(req, true)
+	if c.baPass != "" {
+		req.SetBasicAuth(c.baUser, c.baPass)
 	}
-	if !*disablePathAppend {
-		req.URL.Path = path.Join(req.URL.Path, "/api/v1/write")
-	}
+	req.URL.Path += writePath
 	resp, err := c.c.Do(req.WithContext(ctx))
 	if err != nil {
 		return fmt.Errorf("error while sending request to %s: %w; Data len %d(%d)",
-			req.URL.Redacted(), err, len(data), r.Size())
+			req.URL, err, len(data), r.Size())
 	}
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusNoContent {
+		body, _ := ioutil.ReadAll(resp.Body)
 		return fmt.Errorf("unexpected response code %d for %s. Response body %q",
-			resp.StatusCode, req.URL.Redacted(), body)
+			resp.StatusCode, req.URL, body)
 	}
 	return nil
 }

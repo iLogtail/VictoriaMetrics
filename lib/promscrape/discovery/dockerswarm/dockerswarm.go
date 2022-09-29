@@ -1,18 +1,11 @@
 package dockerswarm
 
 import (
-	"flag"
 	"fmt"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
-
-// SDCheckInterval defines interval for dockerswarm targets refresh.
-var SDCheckInterval = flag.Duration("promscrape.dockerswarmSDCheckInterval", 30*time.Second, "Interval for checking for changes in dockerswarm. "+
-	"This works only if dockerswarm_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://docs.victoriametrics.com/sd_configs.html#dockerswarm_sd_configs for details")
 
 // SDConfig represents docker swarm service discovery configuration
 //
@@ -24,7 +17,7 @@ type SDConfig struct {
 	Filters []Filter `yaml:"filters,omitempty"`
 
 	HTTPClientConfig  promauth.HTTPClientConfig  `yaml:",inline"`
-	ProxyURL          *proxy.URL                 `yaml:"proxy_url,omitempty"`
+	ProxyURL          proxy.URL                  `yaml:"proxy_url,omitempty"`
 	ProxyClientConfig promauth.ProxyClientConfig `yaml:",inline"`
 	// refresh_interval is obtained from `-promscrape.dockerswarmSDCheckInterval` command-line option
 }

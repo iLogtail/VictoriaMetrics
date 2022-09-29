@@ -3,15 +3,12 @@ package fs
 import (
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/filestream"
@@ -177,75 +174,25 @@ func mustSyncParentDirIfExists(path string) {
 	MustSyncPath(parentDirPath)
 }
 
-// IsEmptyDir returns true if path points to empty directory.
-func IsEmptyDir(path string) bool {
-	// See https://stackoverflow.com/a/30708914/274937
-	f, err := os.Open(path)
-	if err != nil {
-		logger.Panicf("FATAL: unexpected error when opening directory %q: %s", path, err)
-	}
-	_, err = f.Readdirnames(1)
-	MustClose(f)
-	if err != nil {
-		if err == io.EOF {
-			return true
-		}
-		logger.Panicf("FATAL: unexpected error when reading directory %q: %s", path, err)
-	}
-	return false
+// MustRemoveAll removes path with all the contents.
+//
+// It properly fsyncs the parent directory after path removal.
+//
+// It properly handles NFS issue https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61 .
+func MustRemoveAll(path string) {
+	_ = mustRemoveAll(path, func() {})
 }
 
-// MustRemoveDirAtomic removes the given dir atomically.
+// MustRemoveAllWithDoneCallback removes path with all the contents.
 //
-// It uses the following algorithm:
+// It properly fsyncs the parent directory after path removal.
 //
-//  1. Atomically rename the "<dir>" to "<dir>.must-remove.<XYZ>",
-//     where <XYZ> is an unique number.
-//  2. Remove the "<dir>.must-remove.XYZ" in background.
+// done is called after the path is successfully removed.
 //
-// If the process crashes after the step 1, then the directory must be removed
-// on the next process start by calling MustRemoveTemporaryDirs on the parent directory.
-func MustRemoveDirAtomic(dir string) {
-	if !IsPathExist(dir) {
-		return
-	}
-	n := atomic.AddUint64(&atomicDirRemoveCounter, 1)
-	tmpDir := fmt.Sprintf("%s.must-remove.%d", dir, n)
-	if err := os.Rename(dir, tmpDir); err != nil {
-		logger.Panicf("FATAL: cannot move %s to %s: %s", dir, tmpDir, err)
-	}
-	MustRemoveAll(tmpDir)
-	parentDir := filepath.Dir(dir)
-	MustSyncPath(parentDir)
-}
-
-var atomicDirRemoveCounter = uint64(time.Now().UnixNano())
-
-// MustRemoveTemporaryDirs removes all the subdirectories with ".must-remove.<XYZ>" suffix.
-//
-// Such directories may be left on unclean shutdown during MustRemoveDirAtomic call.
-func MustRemoveTemporaryDirs(dir string) {
-	d, err := os.Open(dir)
-	if err != nil {
-		logger.Panicf("FATAL: cannot open dir %q: %s", dir, err)
-	}
-	defer MustClose(d)
-	fis, err := d.Readdir(-1)
-	if err != nil {
-		logger.Panicf("FATAL: cannot read dir %q: %s", dir, err)
-	}
-	for _, fi := range fis {
-		if !IsDirOrSymlink(fi) {
-			// Skip non-directories
-			continue
-		}
-		dirName := fi.Name()
-		if strings.Contains(dirName, ".must-remove.") {
-			fullPath := dir + "/" + dirName
-			MustRemoveAll(fullPath)
-		}
-	}
-	MustSyncPath(dir)
+// done may be called after the function returns for NFS path.
+// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/61.
+func MustRemoveAllWithDoneCallback(path string, done func()) {
+	_ = mustRemoveAll(path, done)
 }
 
 // HardLinkFiles makes hard links for all the files from srcDir in dstDir.
@@ -302,20 +249,20 @@ func SymlinkRelative(srcPath, dstPath string) error {
 
 // CopyDirectory copies all the files in srcPath to dstPath.
 func CopyDirectory(srcPath, dstPath string) error {
-	des, err := os.ReadDir(srcPath)
+	fis, err := ioutil.ReadDir(srcPath)
 	if err != nil {
 		return err
 	}
 	if err := MkdirAllIfNotExist(dstPath); err != nil {
 		return err
 	}
-	for _, de := range des {
-		if !de.Type().IsRegular() {
+	for _, fi := range fis {
+		if !fi.Mode().IsRegular() {
 			// Skip non-files
 			continue
 		}
-		src := filepath.Join(srcPath, de.Name())
-		dst := filepath.Join(dstPath, de.Name())
+		src := filepath.Join(srcPath, fi.Name())
+		dst := filepath.Join(dstPath, fi.Name())
 		if err := copyFile(src, dst); err != nil {
 			return err
 		}
@@ -406,41 +353,4 @@ var (
 type freeSpaceEntry struct {
 	updateTime uint64
 	freeSpace  uint64
-}
-
-// ReadFileOrHTTP reads path either from local filesystem or from http if path starts with http or https.
-func ReadFileOrHTTP(path string) ([]byte, error) {
-	if isHTTPURL(path) {
-		// reads remote file via http or https, if url is given
-		resp, err := http.Get(path)
-		if err != nil {
-			return nil, fmt.Errorf("cannot fetch %q: %w", path, err)
-		}
-		data, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("cannot read %q: %s", path, err)
-		}
-		return data, nil
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read %q: %w", path, err)
-	}
-	return data, nil
-}
-
-// GetFilepath returns full path to file for the given baseDir and path.
-func GetFilepath(baseDir, path string) string {
-	if filepath.IsAbs(path) || isHTTPURL(path) {
-		return path
-	}
-	return filepath.Join(baseDir, path)
-}
-
-// isHTTPURL checks if a given targetURL is valid and contains a valid http scheme
-func isHTTPURL(targetURL string) bool {
-	parsed, err := url.Parse(targetURL)
-	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
-
 }

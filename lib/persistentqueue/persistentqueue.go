@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"regexp"
 	"strconv"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
@@ -51,6 +51,8 @@ type queue struct {
 
 	lastMetainfoFlushTime uint64
 
+	mustStop bool
+
 	blocksDropped *metrics.Counter
 	bytesDropped  *metrics.Counter
 
@@ -59,6 +61,8 @@ type queue struct {
 
 	blocksRead *metrics.Counter
 	bytesRead  *metrics.Counter
+
+	bytesPending *metrics.Gauge
 }
 
 // ResetIfEmpty resets q if it is empty.
@@ -112,9 +116,6 @@ func (q *queue) mustResetFiles() {
 
 // GetPendingBytes returns the number of pending bytes in the queue.
 func (q *queue) GetPendingBytes() uint64 {
-	if q.readerOffset > q.writerOffset {
-		logger.Panicf("BUG: readerOffset=%d cannot exceed writerOffset=%d", q.readerOffset, q.writerOffset)
-	}
 	n := q.writerOffset - q.readerOffset
 	return n
 }
@@ -172,6 +173,9 @@ func tryOpeningQueue(path, name string, chunkFileSize, maxBlockSize, maxPendingB
 	q.bytesWritten = metrics.GetOrCreateCounter(fmt.Sprintf(`vm_persistentqueue_bytes_written_total{path=%q}`, path))
 	q.blocksRead = metrics.GetOrCreateCounter(fmt.Sprintf(`vm_persistentqueue_blocks_read_total{path=%q}`, path))
 	q.bytesRead = metrics.GetOrCreateCounter(fmt.Sprintf(`vm_persistentqueue_bytes_read_total{path=%q}`, path))
+	q.bytesPending = metrics.GetOrCreateGauge(fmt.Sprintf(`vm_persistentqueue_bytes_pending{path=%q}`, path), func() float64 {
+		return float64(q.GetPendingBytes())
+	})
 
 	cleanOnError := func() {
 		if q.reader != nil {
@@ -220,14 +224,14 @@ func tryOpeningQueue(path, name string, chunkFileSize, maxBlockSize, maxPendingB
 	}
 
 	// Locate reader and writer chunks in the path.
-	des, err := os.ReadDir(path)
+	fis, err := ioutil.ReadDir(path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read contents of the directory %q: %w", path, err)
 	}
-	for _, de := range des {
-		fname := de.Name()
+	for _, fi := range fis {
+		fname := fi.Name()
 		filepath := path + "/" + fname
-		if de.IsDir() {
+		if fi.IsDir() {
 			logger.Errorf("skipping unknown directory %q", filepath)
 			continue
 		}
@@ -366,9 +370,14 @@ func (q *queue) metainfoPath() string {
 // MustWriteBlock writes block to q.
 //
 // The block size cannot exceed MaxBlockSize.
+//
+// It is safe calling this function from concurrent goroutines.
 func (q *queue) MustWriteBlock(block []byte) {
 	if uint64(len(block)) > q.maxBlockSize {
 		logger.Panicf("BUG: too big block to send: %d bytes; it mustn't exceed %d bytes", len(block), q.maxBlockSize)
+	}
+	if q.mustStop {
+		logger.Panicf("BUG: MustWriteBlock cannot be called after MustClose")
 	}
 	if q.readerOffset > q.writerOffset {
 		logger.Panicf("BUG: readerOffset=%d shouldn't exceed writerOffset=%d", q.readerOffset, q.writerOffset)
@@ -409,10 +418,6 @@ func (q *queue) MustWriteBlock(block []byte) {
 var blockBufPool bytesutil.ByteBufferPool
 
 func (q *queue) writeBlock(block []byte) error {
-	startTime := time.Now()
-	defer func() {
-		writeDurationSeconds.Add(time.Since(startTime).Seconds())
-	}()
 	if q.writerLocalOffset+q.maxBlockSize+8 > q.chunkFileSize {
 		if err := q.nextChunkFileForWrite(); err != nil {
 			return fmt.Errorf("cannot create next chunk file: %w", err)
@@ -437,8 +442,6 @@ func (q *queue) writeBlock(block []byte) error {
 	q.bytesWritten.Add(len(block))
 	return q.flushWriterMetainfoIfNeeded()
 }
-
-var writeDurationSeconds = metrics.NewFloatCounter(`vm_persistentqueue_write_duration_seconds_total`)
 
 func (q *queue) nextChunkFileForWrite() error {
 	// Finalize the current chunk and start new one.
@@ -485,10 +488,6 @@ func (q *queue) MustReadBlockNonblocking(dst []byte) ([]byte, bool) {
 }
 
 func (q *queue) readBlock(dst []byte) ([]byte, error) {
-	startTime := time.Now()
-	defer func() {
-		readDurationSeconds.Add(time.Since(startTime).Seconds())
-	}()
 	if q.readerLocalOffset+q.maxBlockSize+8 > q.chunkFileSize {
 		if err := q.nextChunkFileForRead(); err != nil {
 			return dst, fmt.Errorf("cannot open next chunk file: %w", err)
@@ -498,7 +497,7 @@ func (q *queue) readBlock(dst []byte) ([]byte, error) {
 again:
 	// Read block len.
 	header := headerBufPool.Get()
-	header.B = bytesutil.ResizeNoCopyMayOverallocate(header.B, 8)
+	header.B = bytesutil.Resize(header.B, 8)
 	err := q.readFull(header.B)
 	blockLen := encoding.UnmarshalUint64(header.B)
 	headerBufPool.Put(header)
@@ -519,7 +518,7 @@ again:
 
 	// Read block contents.
 	dstLen := len(dst)
-	dst = bytesutil.ResizeWithCopyMayOverallocate(dst, dstLen+int(blockLen))
+	dst = bytesutil.Resize(dst, dstLen+int(blockLen))
 	if err := q.readFull(dst[dstLen:]); err != nil {
 		logger.Errorf("skipping corrupted %q, since contents with size %d bytes cannot be read from it: %s", q.readerPath, blockLen, err)
 		if err := q.skipBrokenChunkFile(); err != nil {
@@ -534,8 +533,6 @@ again:
 	}
 	return dst, nil
 }
-
-var readDurationSeconds = metrics.NewFloatCounter(`vm_persistentqueue_read_duration_seconds_total`)
 
 func (q *queue) skipBrokenChunkFile() error {
 	// Try to recover from broken chunk file by skipping it.
@@ -556,9 +553,6 @@ func (q *queue) nextChunkFileForRead() error {
 	fs.MustRemoveAll(q.readerPath)
 	if n := q.readerOffset % q.chunkFileSize; n > 0 {
 		q.readerOffset += q.chunkFileSize - n
-	}
-	if err := q.checkReaderWriterOffsets(); err != nil {
-		return err
 	}
 	q.readerLocalOffset = 0
 	q.readerPath = q.chunkFilePath(q.readerOffset)
@@ -603,14 +597,6 @@ func (q *queue) readFull(buf []byte) error {
 	}
 	q.readerLocalOffset += bufLen
 	q.readerOffset += bufLen
-	return q.checkReaderWriterOffsets()
-}
-
-func (q *queue) checkReaderWriterOffsets() error {
-	if q.readerOffset > q.writerOffset {
-		return fmt.Errorf("readerOffset=%d cannot exceed writerOffset=%d; it is likely persistent queue files were corrupted on unclean shutdown",
-			q.readerOffset, q.writerOffset)
-	}
 	return nil
 }
 
@@ -670,7 +656,7 @@ func (mi *metainfo) WriteToFile(path string) error {
 	if err != nil {
 		return fmt.Errorf("cannot marshal persistent queue metainfo %#v: %w", mi, err)
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := ioutil.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("cannot write persistent queue metainfo to %q: %w", path, err)
 	}
 	fs.MustSyncPath(path)
@@ -679,7 +665,7 @@ func (mi *metainfo) WriteToFile(path string) error {
 
 func (mi *metainfo) ReadFromFile(path string) error {
 	mi.Reset()
-	data, err := os.ReadFile(path)
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return err

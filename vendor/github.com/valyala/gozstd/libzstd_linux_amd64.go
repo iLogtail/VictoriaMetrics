@@ -1,5 +1,3 @@
-// +build !musl
-
 package gozstd
 
 /*

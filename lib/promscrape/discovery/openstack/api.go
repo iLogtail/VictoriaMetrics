@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -33,7 +33,7 @@ type apiConfig struct {
 	// tokenLock guards creds refresh
 	tokenLock sync.Mutex
 	creds     *apiCredentials
-	// authTokenReq contains request body for apiCredentials
+	// authTokenReq contins request body for apiCredentials
 	authTokenReq []byte
 	// keystone endpoint
 	endpoint   *url.URL
@@ -70,28 +70,19 @@ func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 
 func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	cfg := &apiConfig{
-		client: &http.Client{
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 100,
-			},
-		},
+		client:       &http.Client{},
 		availability: sdc.Availability,
 		region:       sdc.Region,
 		allTenants:   sdc.AllTenants,
 		port:         sdc.Port,
 	}
 	if sdc.TLSConfig != nil {
-		opts := &promauth.Options{
-			BaseDir:   baseDir,
-			TLSConfig: sdc.TLSConfig,
-		}
-		ac, err := opts.NewConfig()
+		ac, err := promauth.NewConfig(baseDir, nil, nil, "", "", sdc.TLSConfig)
 		if err != nil {
 			return nil, err
 		}
 		cfg.client.Transport = &http.Transport{
-			TLSClientConfig:     ac.NewTLSConfig(),
-			MaxIdleConnsPerHost: 100,
+			TLSClientConfig: ac.NewTLSConfig(),
 		}
 	}
 	// use public compute endpoint by default
@@ -138,7 +129,7 @@ func getCreds(cfg *apiConfig) (*apiCredentials, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed query openstack identity api, url: %s, err: %w", apiURL.String(), err)
 	}
-	r, err := io.ReadAll(resp.Body)
+	r, err := ioutil.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("cannot read response from %q: %w", apiURL.String(), err)
@@ -168,7 +159,7 @@ func getCreds(cfg *apiConfig) (*apiCredentials, error) {
 
 // readResponseBody reads body from http.Response.
 func readResponseBody(resp *http.Response, apiURL string) ([]byte, error) {
-	data, err := io.ReadAll(resp.Body)
+	data, err := ioutil.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("cannot read response from %q: %w", apiURL, err)

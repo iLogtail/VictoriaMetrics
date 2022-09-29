@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,33 +11,40 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/azure"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/consul"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/digitalocean"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/dns"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/docker"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/dockerswarm"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/ec2"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/eureka"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/gce"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/http"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/kubernetes"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/openstack"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/yandexcloud"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
 	configCheckInterval = flag.Duration("promscrape.configCheckInterval", 0, "Interval for checking for changes in '-promscrape.config' file. "+
 		"By default the checking is disabled. Send SIGHUP signal in order to force config check for changes")
-	suppressDuplicateScrapeTargetErrors = flag.Bool("promscrape.suppressDuplicateScrapeTargetErrors", false, "Whether to suppress 'duplicate scrape target' errors; "+
-		"see https://docs.victoriametrics.com/vmagent.html#troubleshooting for details")
+	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", 30*time.Second, "Interval for checking for changes in 'file_sd_config'. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#file_sd_config for details")
+	kubernetesSDCheckInterval = flag.Duration("promscrape.kubernetesSDCheckInterval", 30*time.Second, "Interval for checking for changes in Kubernetes API server. "+
+		"This works only if kubernetes_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#kubernetes_sd_config for details")
+	openstackSDCheckInterval = flag.Duration("promscrape.openstackSDCheckInterval", 30*time.Second, "Interval for checking for changes in openstack API server. "+
+		"This works only if openstack_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#openstack_sd_config for details")
+	eurekaSDCheckInterval = flag.Duration("promscrape.eurekaSDCheckInterval", 30*time.Second, "Interval for checking for changes in eureka. "+
+		"This works only if eureka_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#eureka_sd_config for details")
+	dnsSDCheckInterval = flag.Duration("promscrape.dnsSDCheckInterval", 30*time.Second, "Interval for checking for changes in dns. "+
+		"This works only if dns_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dns_sd_config for details")
+	ec2SDCheckInterval = flag.Duration("promscrape.ec2SDCheckInterval", time.Minute, "Interval for checking for changes in ec2. "+
+		"This works only if ec2_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#ec2_sd_config for details")
+	gceSDCheckInterval = flag.Duration("promscrape.gceSDCheckInterval", time.Minute, "Interval for checking for changes in gce. "+
+		"This works only if gce_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#gce_sd_config for details")
+	dockerswarmSDCheckInterval = flag.Duration("promscrape.dockerswarmSDCheckInterval", 30*time.Second, "Interval for checking for changes in dockerswarm. "+
+		"This works only if dockerswarm_sd_configs is configured in '-promscrape.config' file. "+
+		"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#dockerswarm_sd_config for details")
 	promscrapeConfigFile = flag.String("promscrape.config", "", "Optional path to Prometheus config file with 'scrape_configs' section containing targets to scrape. "+
-		"The path can point to local file and to http url. "+
-		"See https://docs.victoriametrics.com/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
-
-	fileSDCheckInterval = flag.Duration("promscrape.fileSDCheckInterval", time.Minute, "Interval for checking for changes in 'file_sd_config'. "+
-		"See https://docs.victoriametrics.com/sd_configs.html#file_sd_configs for details")
+		"See https://victoriametrics.github.io/#how-to-scrape-prometheus-exporters-such-as-node-exporter for details")
+	suppressDuplicateScrapeTargetErrors = flag.Bool("promscrape.suppressDuplicateScrapeTargetErrors", false, "Whether to suppress 'duplicate scrape target' errors; "+
+		"see https://victoriametrics.github.io/vmagent.html#troubleshooting for details")
 )
 
 // CheckConfig checks -promscrape.config for errors and unsupported options.
@@ -54,80 +59,55 @@ func CheckConfig() error {
 // Init initializes Prometheus scraper with config from the `-promscrape.config`.
 //
 // Scraped data is passed to pushData.
-func Init(pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
-	mustInitClusterMemberID()
-	globalStopChan = make(chan struct{})
+func Init(pushData func(wr *prompbmarshal.WriteRequest)) {
+	globalStopCh = make(chan struct{})
 	scraperWG.Add(1)
 	go func() {
 		defer scraperWG.Done()
-		runScraper(*promscrapeConfigFile, pushData, globalStopChan)
+		runScraper(*promscrapeConfigFile, pushData, globalStopCh)
 	}()
 }
 
 // Stop stops Prometheus scraper.
 func Stop() {
-	close(globalStopChan)
+	close(globalStopCh)
 	scraperWG.Wait()
 }
 
 var (
-	globalStopChan chan struct{}
-	scraperWG      sync.WaitGroup
+	globalStopCh chan struct{}
+	scraperWG    sync.WaitGroup
 	// PendingScrapeConfigs - zero value means, that
 	// all scrapeConfigs are inited and ready for work.
 	PendingScrapeConfigs int32
-
-	// configData contains -promscrape.config data
-	configData atomic.Value
 )
 
-// WriteConfigData writes -promscrape.config contents to w
-func WriteConfigData(w io.Writer) {
-	v := configData.Load()
-	if v == nil {
-		// Nothing to write to w
-		return
-	}
-	b := v.(*[]byte)
-	_, _ = w.Write(*b)
-}
-
-func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) {
+func runScraper(configFile string, pushData func(wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) {
 	if configFile == "" {
 		// Nothing to scrape.
 		return
 	}
-
-	// Register SIGHUP handler for config reload before loadConfig.
-	// This guarantees that the config will be re-read if the signal arrives just after loadConfig.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240
-	sighupCh := procutil.NewSighupChan()
 
 	logger.Infof("reading Prometheus configs from %q", configFile)
 	cfg, data, err := loadConfig(configFile)
 	if err != nil {
 		logger.Fatalf("cannot read %q: %s", configFile, err)
 	}
-	marshaledData := cfg.marshal()
-	configData.Store(&marshaledData)
 	cfg.mustStart()
 
-	scs := newScrapeConfigs(pushData, globalStopCh)
-	scs.add("azure_sd_configs", *azure.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getAzureSDScrapeWork(swsPrev) })
-	scs.add("consul_sd_configs", *consul.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
-	scs.add("digitalocean_sd_configs", *digitalocean.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDigitalOceanDScrapeWork(swsPrev) })
-	scs.add("dns_sd_configs", *dns.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDNSSDScrapeWork(swsPrev) })
-	scs.add("docker_sd_configs", *docker.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDockerSDScrapeWork(swsPrev) })
-	scs.add("dockerswarm_sd_configs", *dockerswarm.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDockerSwarmSDScrapeWork(swsPrev) })
-	scs.add("ec2_sd_configs", *ec2.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEC2SDScrapeWork(swsPrev) })
-	scs.add("eureka_sd_configs", *eureka.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEurekaSDScrapeWork(swsPrev) })
-	scs.add("file_sd_configs", *fileSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getFileSDScrapeWork(swsPrev) })
-	scs.add("gce_sd_configs", *gce.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
-	scs.add("http_sd_configs", *http.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getHTTPDScrapeWork(swsPrev) })
-	scs.add("kubernetes_sd_configs", *kubernetes.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
-	scs.add("openstack_sd_configs", *openstack.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getOpenStackSDScrapeWork(swsPrev) })
-	scs.add("yandexcloud_sd_configs", *yandexcloud.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getYandexCloudSDScrapeWork(swsPrev) })
+	scs := newScrapeConfigs(pushData)
 	scs.add("static_configs", 0, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getStaticScrapeWork() })
+	scs.add("file_sd_configs", *fileSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getFileSDScrapeWork(swsPrev) })
+	scs.add("kubernetes_sd_configs", *kubernetesSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getKubernetesSDScrapeWork(swsPrev) })
+	scs.add("openstack_sd_configs", *openstackSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getOpenStackSDScrapeWork(swsPrev) })
+	scs.add("consul_sd_configs", *consul.SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getConsulSDScrapeWork(swsPrev) })
+	scs.add("eureka_sd_configs", *eurekaSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEurekaSDScrapeWork(swsPrev) })
+	scs.add("dns_sd_configs", *dnsSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDNSSDScrapeWork(swsPrev) })
+	scs.add("ec2_sd_configs", *ec2SDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getEC2SDScrapeWork(swsPrev) })
+	scs.add("gce_sd_configs", *gceSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getGCESDScrapeWork(swsPrev) })
+	scs.add("dockerswarm_sd_configs", *dockerswarmSDCheckInterval, func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork { return cfg.getDockerSwarmSDScrapeWork(swsPrev) })
+
+	sighupCh := procutil.NewSighupChan()
 
 	var tickerCh <-chan time.Time
 	if *configCheckInterval > 0 {
@@ -150,11 +130,10 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 				logger.Infof("nothing changed in %q", configFile)
 				goto waitForChans
 			}
-			cfgNew.mustRestart(cfg)
+			cfg.mustStop()
+			cfgNew.mustStart()
 			cfg = cfgNew
 			data = dataNew
-			marshaledData = cfgNew.marshal()
-			configData.Store(&marshaledData)
 		case <-tickerCh:
 			cfgNew, dataNew, err := loadConfig(configFile)
 			if err != nil {
@@ -165,11 +144,10 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 				// Nothing changed since the previous loadConfig
 				goto waitForChans
 			}
-			cfgNew.mustRestart(cfg)
+			cfg.mustStop()
+			cfgNew.mustStart()
 			cfg = cfgNew
 			data = dataNew
-			marshaledData = cfgNew.marshal()
-			configData.Store(&marshaledData)
 		case <-globalStopCh:
 			cfg.mustStop()
 			logger.Infof("stopping Prometheus scrapers")
@@ -186,18 +164,16 @@ func runScraper(configFile string, pushData func(at *auth.Token, wr *prompbmarsh
 var configReloads = metrics.NewCounter(`vm_promscrape_config_reloads_total`)
 
 type scrapeConfigs struct {
-	pushData     func(at *auth.Token, wr *prompbmarshal.WriteRequest)
-	wg           sync.WaitGroup
-	stopCh       chan struct{}
-	globalStopCh <-chan struct{}
-	scfgs        []*scrapeConfig
+	pushData func(wr *prompbmarshal.WriteRequest)
+	wg       sync.WaitGroup
+	stopCh   chan struct{}
+	scfgs    []*scrapeConfig
 }
 
-func newScrapeConfigs(pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) *scrapeConfigs {
+func newScrapeConfigs(pushData func(wr *prompbmarshal.WriteRequest)) *scrapeConfigs {
 	return &scrapeConfigs{
-		pushData:     pushData,
-		stopCh:       make(chan struct{}),
-		globalStopCh: globalStopCh,
+		pushData: pushData,
+		stopCh:   make(chan struct{}),
 	}
 }
 
@@ -216,7 +192,7 @@ func (scs *scrapeConfigs) add(name string, checkInterval time.Duration, getScrap
 	scs.wg.Add(1)
 	go func() {
 		defer scs.wg.Done()
-		scfg.run(scs.globalStopCh)
+		scfg.run()
 	}()
 	scs.scfgs = append(scs.scfgs, scfg)
 }
@@ -235,7 +211,7 @@ func (scs *scrapeConfigs) stop() {
 
 type scrapeConfig struct {
 	name          string
-	pushData      func(at *auth.Token, wr *prompbmarshal.WriteRequest)
+	pushData      func(wr *prompbmarshal.WriteRequest)
 	getScrapeWork func(cfg *Config, swsPrev []*ScrapeWork) []*ScrapeWork
 	checkInterval time.Duration
 	cfgCh         chan *Config
@@ -244,8 +220,8 @@ type scrapeConfig struct {
 	discoveryDuration *metrics.Histogram
 }
 
-func (scfg *scrapeConfig) run(globalStopCh <-chan struct{}) {
-	sg := newScraperGroup(scfg.name, scfg.pushData, globalStopCh)
+func (scfg *scrapeConfig) run() {
+	sg := newScraperGroup(scfg.name, scfg.pushData)
 	defer sg.stop()
 
 	var tickerCh <-chan time.Time
@@ -262,11 +238,7 @@ func (scfg *scrapeConfig) run(globalStopCh <-chan struct{}) {
 		sws := scfg.getScrapeWork(cfg, swsPrev)
 		sg.update(sws)
 		swsPrev = sws
-		if sg.scrapersStarted.Get() > 0 {
-			// update duration only if at least one scraper has started
-			// otherwise this SD is considered as inactive
-			scfg.discoveryDuration.UpdateDuration(startTime)
-		}
+		scfg.discoveryDuration.UpdateDuration(startTime)
 	}
 	updateScrapeWork(cfg)
 	atomic.AddInt32(&PendingScrapeConfigs, -1)
@@ -288,17 +260,15 @@ type scraperGroup struct {
 	wg       sync.WaitGroup
 	mLock    sync.Mutex
 	m        map[string]*scraper
-	pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)
+	pushData func(wr *prompbmarshal.WriteRequest)
 
 	changesCount    *metrics.Counter
 	activeScrapers  *metrics.Counter
 	scrapersStarted *metrics.Counter
 	scrapersStopped *metrics.Counter
-
-	globalStopCh <-chan struct{}
 }
 
-func newScraperGroup(name string, pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest), globalStopCh <-chan struct{}) *scraperGroup {
+func newScraperGroup(name string, pushData func(wr *prompbmarshal.WriteRequest)) *scraperGroup {
 	sg := &scraperGroup{
 		name:     name,
 		m:        make(map[string]*scraper),
@@ -308,8 +278,6 @@ func newScraperGroup(name string, pushData func(at *auth.Token, wr *prompbmarsha
 		activeScrapers:  metrics.NewCounter(fmt.Sprintf(`vm_promscrape_active_scrapers{type=%q}`, name)),
 		scrapersStarted: metrics.NewCounter(fmt.Sprintf(`vm_promscrape_scrapers_started_total{type=%q}`, name)),
 		scrapersStopped: metrics.NewCounter(fmt.Sprintf(`vm_promscrape_scrapers_stopped_total{type=%q}`, name)),
-
-		globalStopCh: globalStopCh,
 	}
 	metrics.NewGauge(fmt.Sprintf(`vm_promscrape_targets{type=%q, status="up"}`, name), func() float64 {
 		return float64(tsmGlobal.StatusByGroup(sg.name, true))
@@ -337,15 +305,14 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 	additionsCount := 0
 	deletionsCount := 0
 	swsMap := make(map[string][]prompbmarshal.Label, len(sws))
-	var swsToStart []*ScrapeWork
 	for _, sw := range sws {
 		key := sw.key()
-		originalLabels, ok := swsMap[key]
-		if ok {
+		originalLabels := swsMap[key]
+		if originalLabels != nil {
 			if !*suppressDuplicateScrapeTargetErrors {
 				logger.Errorf("skipping duplicate scrape target with identical labels; endpoint=%s, labels=%s; "+
 					"make sure service discovery and relabeling is set up properly; "+
-					"see also https://docs.victoriametrics.com/vmagent.html#troubleshooting; "+
+					"see also https://victoriametrics.github.io/vmagent.html#troubleshooting; "+
 					"original labels for target1: %s; original labels for target2: %s",
 					sw.ScrapeURL, sw.LabelsString(), promLabelsString(originalLabels), promLabelsString(sw.OriginalLabels))
 			}
@@ -357,45 +324,31 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 			// The scraper for the given key already exists.
 			continue
 		}
-		swsToStart = append(swsToStart, sw)
-	}
 
-	// Stop deleted scrapers before starting new scrapers in order to prevent
-	// series overlap when old scrape target is substituted by new scrape target.
-	var stoppedChs []<-chan struct{}
-	for key, sc := range sg.m {
-		if _, ok := swsMap[key]; !ok {
-			close(sc.stopCh)
-			stoppedChs = append(stoppedChs, sc.stoppedCh)
-			delete(sg.m, key)
-			deletionsCount++
-		}
-	}
-	// Wait until all the deleted scrapers are stopped before starting new scrapers.
-	for _, ch := range stoppedChs {
-		<-ch
-	}
-
-	// Start new scrapers only after the deleted scrapers are stopped.
-	for _, sw := range swsToStart {
+		// Start a scraper for the missing key.
 		sc := newScraper(sw, sg.name, sg.pushData)
 		sg.activeScrapers.Inc()
 		sg.scrapersStarted.Inc()
 		sg.wg.Add(1)
-		tsmGlobal.Register(&sc.sw)
+		tsmGlobal.Register(sw)
 		go func(sw *ScrapeWork) {
-			defer func() {
-				sg.wg.Done()
-				close(sc.stoppedCh)
-			}()
-			sc.sw.run(sc.stopCh, sg.globalStopCh)
-			tsmGlobal.Unregister(&sc.sw)
+			defer sg.wg.Done()
+			sc.sw.run(sc.stopCh)
+			tsmGlobal.Unregister(sw)
 			sg.activeScrapers.Dec()
 			sg.scrapersStopped.Inc()
 		}(sw)
-		key := sw.key()
 		sg.m[key] = sc
 		additionsCount++
+	}
+
+	// Stop deleted scrapers, which are missing in sws.
+	for key, sc := range sg.m {
+		if _, ok := swsMap[key]; !ok {
+			close(sc.stopCh)
+			delete(sg.m, key)
+			deletionsCount++
+		}
 	}
 
 	if additionsCount > 0 || deletionsCount > 0 {
@@ -405,19 +358,13 @@ func (sg *scraperGroup) update(sws []*ScrapeWork) {
 }
 
 type scraper struct {
-	sw scrapeWork
-
-	// stopCh is unblocked when the given scraper must be stopped.
+	sw     scrapeWork
 	stopCh chan struct{}
-
-	// stoppedCh is unblocked when the given scraper is stopped.
-	stoppedCh chan struct{}
 }
 
-func newScraper(sw *ScrapeWork, group string, pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)) *scraper {
+func newScraper(sw *ScrapeWork, group string, pushData func(wr *prompbmarshal.WriteRequest)) *scraper {
 	sc := &scraper{
-		stopCh:    make(chan struct{}),
-		stoppedCh: make(chan struct{}),
+		stopCh: make(chan struct{}),
 	}
 	c := newClient(sw)
 	sc.sw.Config = sw

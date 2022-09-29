@@ -11,87 +11,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 )
 
-func TestRecordingRule_Exec(t *testing.T) {
-	timestamp := time.Now()
-	testCases := []struct {
-		rule    *RecordingRule
-		metrics []datasource.Metric
-		expTS   []prompbmarshal.TimeSeries
-	}{
-		{
-			&RecordingRule{Name: "foo", state: newRuleState()},
-			[]datasource.Metric{metricWithValueAndLabels(t, 10,
-				"__name__", "bar",
-			)},
-			[]prompbmarshal.TimeSeries{
-				newTimeSeries([]float64{10}, []int64{timestamp.UnixNano()}, map[string]string{
-					"__name__": "foo",
-				}),
-			},
-		},
-		{
-			&RecordingRule{Name: "foobarbaz", state: newRuleState()},
-			[]datasource.Metric{
-				metricWithValueAndLabels(t, 1, "__name__", "foo", "job", "foo"),
-				metricWithValueAndLabels(t, 2, "__name__", "bar", "job", "bar"),
-				metricWithValueAndLabels(t, 3, "__name__", "baz", "job", "baz"),
-			},
-			[]prompbmarshal.TimeSeries{
-				newTimeSeries([]float64{1}, []int64{timestamp.UnixNano()}, map[string]string{
-					"__name__": "foobarbaz",
-					"job":      "foo",
-				}),
-				newTimeSeries([]float64{2}, []int64{timestamp.UnixNano()}, map[string]string{
-					"__name__": "foobarbaz",
-					"job":      "bar",
-				}),
-				newTimeSeries([]float64{3}, []int64{timestamp.UnixNano()}, map[string]string{
-					"__name__": "foobarbaz",
-					"job":      "baz",
-				}),
-			},
-		},
-		{
-			&RecordingRule{
-				Name:  "job:foo",
-				state: newRuleState(),
-				Labels: map[string]string{
-					"source": "test",
-				}},
-			[]datasource.Metric{
-				metricWithValueAndLabels(t, 2, "__name__", "foo", "job", "foo"),
-				metricWithValueAndLabels(t, 1, "__name__", "bar", "job", "bar")},
-			[]prompbmarshal.TimeSeries{
-				newTimeSeries([]float64{2}, []int64{timestamp.UnixNano()}, map[string]string{
-					"__name__": "job:foo",
-					"job":      "foo",
-					"source":   "test",
-				}),
-				newTimeSeries([]float64{1}, []int64{timestamp.UnixNano()}, map[string]string{
-					"__name__": "job:foo",
-					"job":      "bar",
-					"source":   "test",
-				}),
-			},
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.rule.Name, func(t *testing.T) {
-			fq := &fakeQuerier{}
-			fq.add(tc.metrics...)
-			tc.rule.q = fq
-			tss, err := tc.rule.Exec(context.TODO(), time.Now(), 0)
-			if err != nil {
-				t.Fatalf("unexpected Exec err: %s", err)
-			}
-			if err := compareTimeSeries(t, tc.expTS, tss); err != nil {
-				t.Fatalf("timeseries missmatch: %s", err)
-			}
-		})
-	}
-}
-
-func TestRecordingRule_ExecRange(t *testing.T) {
+func TestRecoridngRule_ToTimeSeries(t *testing.T) {
 	timestamp := time.Now()
 	testCases := []struct {
 		rule    *RecordingRule
@@ -100,39 +20,35 @@ func TestRecordingRule_ExecRange(t *testing.T) {
 	}{
 		{
 			&RecordingRule{Name: "foo"},
-			[]datasource.Metric{metricWithValuesAndLabels(t, []float64{10, 20, 30},
+			[]datasource.Metric{metricWithValueAndLabels(t, 10,
 				"__name__", "bar",
 			)},
 			[]prompbmarshal.TimeSeries{
-				newTimeSeries([]float64{10, 20, 30},
-					[]int64{timestamp.UnixNano(), timestamp.UnixNano(), timestamp.UnixNano()},
-					map[string]string{
-						"__name__": "foo",
-					}),
+				newTimeSeries(10, map[string]string{
+					"__name__": "foo",
+				}, timestamp),
 			},
 		},
 		{
 			&RecordingRule{Name: "foobarbaz"},
 			[]datasource.Metric{
-				metricWithValuesAndLabels(t, []float64{1}, "__name__", "foo", "job", "foo"),
-				metricWithValuesAndLabels(t, []float64{2, 3}, "__name__", "bar", "job", "bar"),
-				metricWithValuesAndLabels(t, []float64{4, 5, 6}, "__name__", "baz", "job", "baz"),
+				metricWithValueAndLabels(t, 1, "__name__", "foo", "job", "foo"),
+				metricWithValueAndLabels(t, 2, "__name__", "bar", "job", "bar"),
+				metricWithValueAndLabels(t, 3, "__name__", "baz", "job", "baz"),
 			},
 			[]prompbmarshal.TimeSeries{
-				newTimeSeries([]float64{1}, []int64{timestamp.UnixNano()}, map[string]string{
+				newTimeSeries(1, map[string]string{
 					"__name__": "foobarbaz",
 					"job":      "foo",
-				}),
-				newTimeSeries([]float64{2, 3}, []int64{timestamp.UnixNano(), timestamp.UnixNano()}, map[string]string{
+				}, timestamp),
+				newTimeSeries(2, map[string]string{
 					"__name__": "foobarbaz",
 					"job":      "bar",
-				}),
-				newTimeSeries([]float64{4, 5, 6},
-					[]int64{timestamp.UnixNano(), timestamp.UnixNano(), timestamp.UnixNano()},
-					map[string]string{
-						"__name__": "foobarbaz",
-						"job":      "baz",
-					}),
+				}, timestamp),
+				newTimeSeries(3, map[string]string{
+					"__name__": "foobarbaz",
+					"job":      "baz",
+				}, timestamp),
 			},
 		},
 		{
@@ -143,16 +59,16 @@ func TestRecordingRule_ExecRange(t *testing.T) {
 				metricWithValueAndLabels(t, 2, "__name__", "foo", "job", "foo"),
 				metricWithValueAndLabels(t, 1, "__name__", "bar", "job", "bar")},
 			[]prompbmarshal.TimeSeries{
-				newTimeSeries([]float64{2}, []int64{timestamp.UnixNano()}, map[string]string{
+				newTimeSeries(2, map[string]string{
 					"__name__": "job:foo",
 					"job":      "foo",
 					"source":   "test",
-				}),
-				newTimeSeries([]float64{1}, []int64{timestamp.UnixNano()}, map[string]string{
+				}, timestamp),
+				newTimeSeries(1, map[string]string{
 					"__name__": "job:foo",
 					"job":      "bar",
 					"source":   "test",
-				}),
+				}, timestamp),
 			},
 		},
 	}
@@ -160,8 +76,7 @@ func TestRecordingRule_ExecRange(t *testing.T) {
 		t.Run(tc.rule.Name, func(t *testing.T) {
 			fq := &fakeQuerier{}
 			fq.add(tc.metrics...)
-			tc.rule.q = fq
-			tss, err := tc.rule.ExecRange(context.TODO(), time.Now(), time.Now())
+			tss, err := tc.rule.Exec(context.TODO(), fq, true)
 			if err != nil {
 				t.Fatalf("unexpected Exec err: %s", err)
 			}
@@ -172,61 +87,16 @@ func TestRecordingRule_ExecRange(t *testing.T) {
 	}
 }
 
-func TestRecordingRuleLimit(t *testing.T) {
-	timestamp := time.Now()
-	testCases := []struct {
-		limit int
-		err   string
-	}{
-		{
-			limit: 0,
-		},
-		{
-			limit: -1,
-		},
-		{
-			limit: 1,
-			err:   "exec exceeded limit of 1 with 3 series",
-		},
-		{
-			limit: 2,
-			err:   "exec exceeded limit of 2 with 3 series",
-		},
-	}
-	testMetrics := []datasource.Metric{
-		metricWithValuesAndLabels(t, []float64{1}, "__name__", "foo", "job", "foo"),
-		metricWithValuesAndLabels(t, []float64{2, 3}, "__name__", "bar", "job", "bar"),
-		metricWithValuesAndLabels(t, []float64{4, 5, 6}, "__name__", "baz", "job", "baz"),
-	}
-	rule := &RecordingRule{Name: "job:foo", state: newRuleState(), Labels: map[string]string{
-		"source": "test_limit",
+func TestRecoridngRule_ToTimeSeriesNegative(t *testing.T) {
+	rr := &RecordingRule{Name: "job:foo", Labels: map[string]string{
+		"job": "test",
 	}}
-	var err error
-	for _, testCase := range testCases {
-		fq := &fakeQuerier{}
-		fq.add(testMetrics...)
-		rule.q = fq
-		_, err = rule.Exec(context.TODO(), timestamp, testCase.limit)
-		if err != nil && !strings.EqualFold(err.Error(), testCase.err) {
-			t.Fatal(err)
-		}
-	}
-}
-
-func TestRecordingRule_ExecNegative(t *testing.T) {
-	rr := &RecordingRule{
-		Name:  "job:foo",
-		state: newRuleState(),
-		Labels: map[string]string{
-			"job": "test",
-		},
-	}
 
 	fq := &fakeQuerier{}
 	expErr := "connection reset by peer"
 	fq.setErr(errors.New(expErr))
-	rr.q = fq
-	_, err := rr.Exec(context.TODO(), time.Now(), 0)
+
+	_, err := rr.Exec(context.TODO(), fq, true)
 	if err == nil {
 		t.Fatalf("expected to get err; got nil")
 	}
@@ -241,7 +111,7 @@ func TestRecordingRule_ExecNegative(t *testing.T) {
 	fq.add(metricWithValueAndLabels(t, 1, "__name__", "foo", "job", "foo"))
 	fq.add(metricWithValueAndLabels(t, 2, "__name__", "foo", "job", "bar"))
 
-	_, err = rr.Exec(context.TODO(), time.Now(), 0)
+	_, err = rr.Exec(context.TODO(), fq, true)
 	if err == nil {
 		t.Fatalf("expected to get err; got nil")
 	}

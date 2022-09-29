@@ -104,9 +104,6 @@ func mustParseWithArgExpr(s string) *withArgExpr {
 func removeParensExpr(e Expr) Expr {
 	if re, ok := e.(*RollupExpr); ok {
 		re.Expr = removeParensExpr(re.Expr)
-		if re.At != nil {
-			re.At = removeParensExpr(re.At)
-		}
 		return re
 	}
 	if be, ok := e.(*BinaryOpExpr); ok {
@@ -147,9 +144,6 @@ func removeParensExpr(e Expr) Expr {
 func simplifyConstants(e Expr) Expr {
 	if re, ok := e.(*RollupExpr); ok {
 		re.Expr = simplifyConstants(re.Expr)
-		if re.At != nil {
-			re.At = simplifyConstants(re.At)
-		}
 		return re
 	}
 	if ae, ok := e.(*AggrFuncExpr); ok {
@@ -306,6 +300,9 @@ func (p *parser) parseWithArgExpr() (*withArgExpr, error) {
 		return nil, fmt.Errorf(`withArgExpr: unexpected token %q; want "ident"`, p.lex.Token)
 	}
 	wa.Name = unescapeIdent(p.lex.Token)
+	if isAggrFunc(wa.Name) || IsRollupFunc(wa.Name) || IsTransformFunc(wa.Name) || isWith(wa.Name) {
+		return nil, fmt.Errorf(`withArgExpr: cannot use reserved name %q`, wa.Name)
+	}
 	if err := p.lex.Next(); err != nil {
 		return nil, err
 	}
@@ -418,26 +415,19 @@ func (p *parser) parseSingleExpr() (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !isRollupStartToken(p.lex.Token) {
+	if p.lex.Token != "[" && !isOffset(p.lex.Token) {
 		// There is no rollup expression.
 		return e, nil
 	}
 	return p.parseRollupExpr(e)
 }
 
-func isRollupStartToken(token string) bool {
-	return token == "[" || token == "@" || isOffset(token)
-}
-
 func (p *parser) parseSingleExprWithoutRollupSuffix() (Expr, error) {
-	if isPositiveDuration(p.lex.Token) {
-		return p.parsePositiveDuration()
+	if isPositiveNumberPrefix(p.lex.Token) || isInfOrNaN(p.lex.Token) {
+		return p.parsePositiveNumberExpr()
 	}
 	if isStringPrefix(p.lex.Token) {
 		return p.parseStringExpr()
-	}
-	if isPositiveNumberPrefix(p.lex.Token) || isInfOrNaN(p.lex.Token) {
-		return p.parsePositiveNumberExpr()
 	}
 	if isIdentPrefix(p.lex.Token) {
 		return p.parseIdentExpr()
@@ -666,12 +656,17 @@ func expandWithExpr(was []*withArgExpr, e Expr) (Expr, error) {
 				return se, nil
 			}
 		}
-		be := *t
-		be.Left = left
-		be.Right = right
+		be := &BinaryOpExpr{
+			Op:            t.Op,
+			Bool:          t.Bool,
+			GroupModifier: t.GroupModifier,
+			JoinModifier:  t.JoinModifier,
+			Left:          left,
+			Right:         right,
+		}
 		be.GroupModifier.Args = groupModifierArgs
 		be.JoinModifier.Args = joinModifierArgs
-		pe := parensExpr{&be}
+		pe := parensExpr{be}
 		return &pe, nil
 	case *FuncExpr:
 		args, err := expandWithArgs(was, t.Args)
@@ -679,29 +674,31 @@ func expandWithExpr(was []*withArgExpr, e Expr) (Expr, error) {
 			return nil, err
 		}
 		wa := getWithArgExpr(was, t.Name)
-		if wa != nil {
-			return expandWithExprExt(was, wa, args)
+		if wa == nil {
+			fe := &FuncExpr{
+				Name: t.Name,
+				Args: args,
+			}
+			return fe, nil
 		}
-		fe := *t
-		fe.Args = args
-		return &fe, nil
+		return expandWithExprExt(was, wa, args)
 	case *AggrFuncExpr:
 		args, err := expandWithArgs(was, t.Args)
 		if err != nil {
 			return nil, err
 		}
-		wa := getWithArgExpr(was, t.Name)
-		if wa != nil {
-			return expandWithExprExt(was, wa, args)
-		}
 		modifierArgs, err := expandModifierArgs(was, t.Modifier.Args)
 		if err != nil {
 			return nil, err
 		}
-		ae := *t
-		ae.Args = args
+		ae := &AggrFuncExpr{
+			Name:     t.Name,
+			Args:     args,
+			Modifier: t.Modifier,
+			Limit:    t.Limit,
+		}
 		ae.Modifier.Args = modifierArgs
-		return &ae, nil
+		return ae, nil
 	case *parensExpr:
 		exprs, err := expandWithArgs(was, *t)
 		if err != nil {
@@ -752,13 +749,6 @@ func expandWithExpr(was []*withArgExpr, e Expr) (Expr, error) {
 		}
 		re := *t
 		re.Expr = eNew
-		if t.At != nil {
-			atNew, err := expandWithExpr(was, t.At)
-			if err != nil {
-				return nil, err
-			}
-			re.At = atNew
-		}
 		return &re, nil
 	case *withExpr:
 		wasNew := make([]*withArgExpr, 0, len(was)+len(t.Was))
@@ -1017,18 +1007,7 @@ func (p *parser) parseFuncExpr() (*FuncExpr, error) {
 		return nil, err
 	}
 	fe.Args = args
-	if isKeepMetricNames(p.lex.Token) {
-		fe.KeepMetricNames = true
-		if err := p.lex.Next(); err != nil {
-			return nil, err
-		}
-	}
 	return &fe, nil
-}
-
-func isKeepMetricNames(token string) bool {
-	token = strings.ToLower(token)
-	return token == "keep_metric_names"
 }
 
 func (p *parser) parseModifierExpr(me *ModifierExpr) error {
@@ -1242,29 +1221,29 @@ func (lfe *labelFilterExpr) toLabelFilter() (*LabelFilter, error) {
 	return &lf, nil
 }
 
-func (p *parser) parseWindowAndStep() (*DurationExpr, *DurationExpr, bool, error) {
+func (p *parser) parseWindowAndStep() (string, string, bool, error) {
 	if p.lex.Token != "[" {
-		return nil, nil, false, fmt.Errorf(`windowAndStep: unexpected token %q; want "["`, p.lex.Token)
+		return "", "", false, fmt.Errorf(`windowAndStep: unexpected token %q; want "["`, p.lex.Token)
 	}
 	err := p.lex.Next()
 	if err != nil {
-		return nil, nil, false, err
+		return "", "", false, err
 	}
-	var window *DurationExpr
+	var window string
 	if !strings.HasPrefix(p.lex.Token, ":") {
 		window, err = p.parsePositiveDuration()
 		if err != nil {
-			return nil, nil, false, err
+			return "", "", false, err
 		}
 	}
-	var step *DurationExpr
+	var step string
 	inheritStep := false
 	if strings.HasPrefix(p.lex.Token, ":") {
 		// Parse step
 		p.lex.Token = p.lex.Token[1:]
 		if p.lex.Token == "" {
 			if err := p.lex.Next(); err != nil {
-				return nil, nil, false, err
+				return "", "", false, err
 			}
 			if p.lex.Token == "]" {
 				inheritStep = true
@@ -1273,108 +1252,63 @@ func (p *parser) parseWindowAndStep() (*DurationExpr, *DurationExpr, bool, error
 		if p.lex.Token != "]" {
 			step, err = p.parsePositiveDuration()
 			if err != nil {
-				return nil, nil, false, err
+				return "", "", false, err
 			}
 		}
 	}
 	if p.lex.Token != "]" {
-		return nil, nil, false, fmt.Errorf(`windowAndStep: unexpected token %q; want "]"`, p.lex.Token)
+		return "", "", false, fmt.Errorf(`windowAndStep: unexpected token %q; want "]"`, p.lex.Token)
 	}
 	if err := p.lex.Next(); err != nil {
-		return nil, nil, false, err
+		return "", "", false, err
 	}
 	return window, step, inheritStep, nil
 }
 
-func (p *parser) parseAtExpr() (Expr, error) {
-	if p.lex.Token != "@" {
-		return nil, fmt.Errorf(`unexpected token %q; want "@"`, p.lex.Token)
-	}
-	if err := p.lex.Next(); err != nil {
-		return nil, err
-	}
-	e, err := p.parseSingleExprWithoutRollupSuffix()
-	if err != nil {
-		return nil, fmt.Errorf("cannot parse `@` expresion: %w", err)
-	}
-	return e, nil
-}
-
-func (p *parser) parseOffset() (*DurationExpr, error) {
+func (p *parser) parseOffset() (string, error) {
 	if !isOffset(p.lex.Token) {
-		return nil, fmt.Errorf(`offset: unexpected token %q; want "offset"`, p.lex.Token)
+		return "", fmt.Errorf(`offset: unexpected token %q; want "offset"`, p.lex.Token)
 	}
 	if err := p.lex.Next(); err != nil {
-		return nil, err
+		return "", err
 	}
-	de, err := p.parseDuration()
+	d, err := p.parseDuration()
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	return de, nil
+	return d, nil
 }
 
-func (p *parser) parseDuration() (*DurationExpr, error) {
-	isNegative := p.lex.Token == "-"
-	if isNegative {
+func (p *parser) parseDuration() (string, error) {
+	isNegative := false
+	if p.lex.Token == "-" {
+		isNegative = true
 		if err := p.lex.Next(); err != nil {
-			return nil, err
+			return "", err
 		}
 	}
-	de, err := p.parsePositiveDuration()
-	if err != nil {
-		return nil, err
+	if !isPositiveDuration(p.lex.Token) {
+		return "", fmt.Errorf(`duration: unexpected token %q; want "duration"`, p.lex.Token)
+	}
+	d := p.lex.Token
+	if err := p.lex.Next(); err != nil {
+		return "", err
 	}
 	if isNegative {
-		de.s = "-" + de.s
+		d = "-" + d
 	}
-	return de, nil
+	return d, nil
 }
 
-func (p *parser) parsePositiveDuration() (*DurationExpr, error) {
-	s := p.lex.Token
-	if isPositiveDuration(s) {
-		if err := p.lex.Next(); err != nil {
-			return nil, err
-		}
-	} else {
-		if !isPositiveNumberPrefix(s) {
-			return nil, fmt.Errorf(`duration: unexpected token %q; want "duration"`, s)
-		}
-		// Verify the duration in seconds without explicit suffix.
-		if _, err := p.parsePositiveNumberExpr(); err != nil {
-			return nil, fmt.Errorf(`duration: parse error: %s`, err)
-		}
-	}
-	de := &DurationExpr{
-		s: s,
-	}
-	return de, nil
-}
-
-// DurationExpr contains the duration
-type DurationExpr struct {
-	s string
-}
-
-// AppendString appends string representation of de to dst and returns the result.
-func (de *DurationExpr) AppendString(dst []byte) []byte {
-	if de == nil {
-		return dst
-	}
-	return append(dst, de.s...)
-}
-
-// Duration returns the duration from de in milliseconds.
-func (de *DurationExpr) Duration(step int64) int64 {
-	if de == nil {
-		return 0
-	}
-	d, err := DurationValue(de.s, step)
+func (p *parser) parsePositiveDuration() (string, error) {
+	d, err := p.parseDuration()
 	if err != nil {
-		panic(fmt.Errorf("BUG: cannot parse duration %q: %s", de.s, err))
+		return "", err
 	}
-	return d
+	if strings.HasPrefix(d, "-") {
+		return "", fmt.Errorf("positiveDuration: expecting positive duration; got %q", d)
+	}
+	return d, nil
 }
 
 // parseIdentExpr parses expressions starting with `ident` token.
@@ -1406,11 +1340,11 @@ func (p *parser) parseIdentExpr() (Expr, error) {
 			return p.parseAggrFuncExpr()
 		}
 		return p.parseFuncExpr()
-	case "{", "[", ")", ",", "@":
+	case "{", "[", ")", ",":
 		p.lex.Prev()
 		return p.parseMetricExpr()
 	default:
-		return nil, fmt.Errorf(`identExpr: unexpected token %q; want "(", "{", "[", ")", "," or "@"`, p.lex.Token)
+		return nil, fmt.Errorf(`identExpr: unexpected token %q; want "(", "{", "[", ")", ","`, p.lex.Token)
 	}
 }
 
@@ -1449,34 +1383,15 @@ func (p *parser) parseRollupExpr(arg Expr) (Expr, error) {
 		re.Window = window
 		re.Step = step
 		re.InheritStep = inheritStep
-		if !isOffset(p.lex.Token) && p.lex.Token != "@" {
+		if !isOffset(p.lex.Token) {
 			return &re, nil
 		}
 	}
-	if p.lex.Token == "@" {
-		at, err := p.parseAtExpr()
-		if err != nil {
-			return nil, err
-		}
-		re.At = at
+	offset, err := p.parseOffset()
+	if err != nil {
+		return nil, err
 	}
-	if isOffset(p.lex.Token) {
-		offset, err := p.parseOffset()
-		if err != nil {
-			return nil, err
-		}
-		re.Offset = offset
-	}
-	if p.lex.Token == "@" {
-		if re.At != nil {
-			return nil, fmt.Errorf("duplicate `@` token")
-		}
-		at, err := p.parseAtExpr()
-		if err != nil {
-			return nil, err
-		}
-		re.At = at
-	}
+	re.Offset = offset
 	return &re, nil
 }
 
@@ -1613,18 +1528,12 @@ type FuncExpr struct {
 
 	// Args contains function args.
 	Args []Expr
-
-	// If KeepMetricNames is set to true, then the function should keep metric names.
-	KeepMetricNames bool
 }
 
 // AppendString appends string representation of fe to dst and returns the result.
 func (fe *FuncExpr) AppendString(dst []byte) []byte {
 	dst = appendEscapedIdent(dst, fe.Name)
 	dst = appendStringArgListExpr(dst, fe.Args)
-	if fe.KeepMetricNames {
-		dst = append(dst, " keep_metric_names"...)
-	}
 	return dst
 }
 
@@ -1719,32 +1628,26 @@ type RollupExpr struct {
 	// Window contains optional window value from square brackets
 	//
 	// For example, `http_requests_total[5m]` will have Window value `5m`.
-	Window *DurationExpr
+	Window string
 
 	// Offset contains optional value from `offset` part.
 	//
 	// For example, `foobar{baz="aa"} offset 5m` will have Offset value `5m`.
-	Offset *DurationExpr
+	Offset string
 
 	// Step contains optional step value from square brackets.
 	//
 	// For example, `foobar[1h:3m]` will have Step value '3m'.
-	Step *DurationExpr
+	Step string
 
 	// If set to true, then `foo[1h:]` would print the same
 	// instead of `foo[1h]`.
 	InheritStep bool
-
-	// At contains an optional expression after `@` modifier.
-	//
-	// For example, `foo @ end()` or `bar[5m] @ 12345`
-	// See https://prometheus.io/docs/prometheus/latest/querying/basics/#modifier
-	At Expr
 }
 
 // ForSubquery returns true if re represents subquery.
 func (re *RollupExpr) ForSubquery() bool {
-	return re.Step != nil || re.InheritStep
+	return len(re.Step) > 0 || re.InheritStep
 }
 
 // AppendString appends string representation of re to dst and returns the result.
@@ -1768,31 +1671,22 @@ func (re *RollupExpr) AppendString(dst []byte) []byte {
 	if needParens {
 		dst = append(dst, ')')
 	}
-	if re.Window != nil || re.InheritStep || re.Step != nil {
+	if len(re.Window) > 0 || re.InheritStep || len(re.Step) > 0 {
 		dst = append(dst, '[')
-		dst = re.Window.AppendString(dst)
-		if re.Step != nil {
+		if len(re.Window) > 0 {
+			dst = append(dst, re.Window...)
+		}
+		if len(re.Step) > 0 {
 			dst = append(dst, ':')
-			dst = re.Step.AppendString(dst)
+			dst = append(dst, re.Step...)
 		} else if re.InheritStep {
 			dst = append(dst, ':')
 		}
 		dst = append(dst, ']')
 	}
-	if re.Offset != nil {
+	if len(re.Offset) > 0 {
 		dst = append(dst, " offset "...)
-		dst = re.Offset.AppendString(dst)
-	}
-	if re.At != nil {
-		dst = append(dst, " @ "...)
-		_, needAtParens := re.At.(*BinaryOpExpr)
-		if needAtParens {
-			dst = append(dst, '(')
-		}
-		dst = re.At.AppendString(dst)
-		if needAtParens {
-			dst = append(dst, ')')
-		}
+		dst = append(dst, re.Offset...)
 	}
 	return dst
 }
@@ -1837,7 +1731,7 @@ func (lf *LabelFilter) AppendString(dst []byte) []byte {
 // MetricExpr represents MetricsQL metric with optional filters, i.e. `foo{...}`.
 type MetricExpr struct {
 	// LabelFilters contains a list of label filters from curly braces.
-	// Filter or metric name must be the first if present.
+	// Metric name if present must be the first.
 	LabelFilters []LabelFilter
 
 	// labelFilters must be expanded to LabelFilters by expandWithExpr.
@@ -1885,9 +1779,6 @@ func (me *MetricExpr) hasNonEmptyMetricGroup() bool {
 	if len(me.LabelFilters) == 0 {
 		return false
 	}
-	return me.LabelFilters[0].isMetricNameFilter()
-}
-
-func (lf *LabelFilter) isMetricNameFilter() bool {
+	lf := &me.LabelFilters[0]
 	return lf.Label == "__name__" && !lf.IsNegative && !lf.IsRegexp
 }

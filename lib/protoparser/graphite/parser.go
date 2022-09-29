@@ -9,10 +9,6 @@ import (
 	"github.com/valyala/fastjson/fastfloat"
 )
 
-// graphite text line protocol may use white space or tab as separator
-// See https://github.com/grobian/carbon-c-relay/commit/f3ffe6cc2b52b07d14acbda649ad3fd6babdd528
-const graphiteSeparators = " \t"
-
 // Rows contains parsed graphite rows.
 type Rows struct {
 	Rows []Row
@@ -61,6 +57,9 @@ func (r *Row) reset() {
 
 // UnmarshalMetricAndTags unmarshals metric and optional tags from s.
 func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
+	if strings.Contains(s, " ") {
+		return tagsPool, fmt.Errorf("unexpected whitespace found in %q", s)
+	}
 	n := strings.IndexByte(s, ';')
 	if n < 0 {
 		// No tags
@@ -69,7 +68,11 @@ func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
 		// Tags found
 		r.Metric = s[:n]
 		tagsStart := len(tagsPool)
-		tagsPool = unmarshalTags(tagsPool, s[n+1:])
+		var err error
+		tagsPool, err = unmarshalTags(tagsPool, s[n+1:])
+		if err != nil {
+			return tagsPool, fmt.Errorf("cannot unmarshal tags: %w", err)
+		}
 		tags := tagsPool[tagsStart:]
 		r.Tags = tags[:len(tags):len(tags)]
 	}
@@ -81,43 +84,38 @@ func (r *Row) UnmarshalMetricAndTags(s string, tagsPool []Tag) ([]Tag, error) {
 
 func (r *Row) unmarshal(s string, tagsPool []Tag) ([]Tag, error) {
 	r.reset()
-	sOrig := s
-	s = stripTrailingWhitespace(s)
-	n := strings.LastIndexAny(s, graphiteSeparators)
+	n := strings.IndexByte(s, ' ')
 	if n < 0 {
-		return tagsPool, fmt.Errorf("cannot find separator between value and timestamp in %q", s)
+		return tagsPool, fmt.Errorf("cannot find whitespace between metric and value in %q", s)
 	}
-	timestampStr := s[n+1:]
-	valueStr := ""
-	metricAndTags := ""
-	s = stripTrailingWhitespace(s[:n])
-	n = strings.LastIndexAny(s, graphiteSeparators)
-	if n < 0 {
-		// Missing timestamp
-		metricAndTags = stripLeadingWhitespace(s)
-		valueStr = timestampStr
-		timestampStr = ""
-	} else {
-		metricAndTags = stripLeadingWhitespace(s[:n])
-		valueStr = s[n+1:]
-	}
-	metricAndTags = stripTrailingWhitespace(metricAndTags)
+	metricAndTags := s[:n]
+	tail := s[n+1:]
+
 	tagsPool, err := r.UnmarshalMetricAndTags(metricAndTags, tagsPool)
 	if err != nil {
-		return tagsPool, fmt.Errorf("cannot parse metric and tags from %q: %w; original line: %q", metricAndTags, err, sOrig)
+		return tagsPool, err
 	}
-	if len(timestampStr) > 0 {
-		ts, err := fastfloat.Parse(timestampStr)
+
+	n = strings.IndexByte(tail, ' ')
+	if n < 0 {
+		// There is no timestamp. Use default timestamp instead.
+		v, err := fastfloat.Parse(tail)
 		if err != nil {
-			return tagsPool, fmt.Errorf("cannot unmarshal timestamp from %q: %w; orignal line: %q", timestampStr, err, sOrig)
+			return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w", tail, err)
 		}
-		r.Timestamp = int64(ts)
+		r.Value = v
+		return tagsPool, nil
 	}
-	v, err := fastfloat.Parse(valueStr)
+	v, err := fastfloat.Parse(tail[:n])
 	if err != nil {
-		return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w; original line: %q", valueStr, err, sOrig)
+		return tagsPool, fmt.Errorf("cannot unmarshal value from %q: %w", tail[:n], err)
+	}
+	ts, err := fastfloat.Parse(tail[n+1:])
+	if err != nil {
+		return tagsPool, fmt.Errorf("cannot unmarshal timestamp from %q: %w", tail[n+1:], err)
 	}
 	r.Value = v
+	r.Timestamp = int64(ts)
 	return tagsPool, nil
 }
 
@@ -138,11 +136,11 @@ func unmarshalRow(dst []Row, s string, tagsPool []Tag) ([]Row, []Tag) {
 	if len(s) > 0 && s[len(s)-1] == '\r' {
 		s = s[:len(s)-1]
 	}
-	s = stripLeadingWhitespace(s)
 	if len(s) == 0 {
 		// Skip empty line
 		return dst, tagsPool
 	}
+
 	if cap(dst) > len(dst) {
 		dst = dst[:len(dst)+1]
 	} else {
@@ -161,7 +159,7 @@ func unmarshalRow(dst []Row, s string, tagsPool []Tag) ([]Row, []Tag) {
 
 var invalidLines = metrics.NewCounter(`vm_rows_invalid_total{type="graphite"}`)
 
-func unmarshalTags(dst []Tag, s string) []Tag {
+func unmarshalTags(dst []Tag, s string) ([]Tag, error) {
 	for {
 		if cap(dst) > len(dst) {
 			dst = dst[:len(dst)+1]
@@ -178,7 +176,7 @@ func unmarshalTags(dst []Tag, s string) []Tag {
 				// Skip empty tag
 				dst = dst[:len(dst)-1]
 			}
-			return dst
+			return dst, nil
 		}
 		tag.unmarshal(s[:n])
 		s = s[n+1:]
@@ -212,31 +210,4 @@ func (t *Tag) unmarshal(s string) {
 		t.Key = s[:n]
 		t.Value = s[n+1:]
 	}
-}
-
-func stripTrailingWhitespace(s string) string {
-	n := len(s)
-	for {
-		n--
-		if n < 0 {
-			return ""
-		}
-		ch := s[n]
-		// graphite text line protocol may use white space or tab as separator
-		// See https://github.com/grobian/carbon-c-relay/commit/f3ffe6cc2b52b07d14acbda649ad3fd6babdd528
-		if ch != ' ' && ch != '\t' {
-			return s[:n+1]
-		}
-	}
-}
-
-func stripLeadingWhitespace(s string) string {
-	for len(s) > 0 {
-		ch := s[0]
-		if ch != ' ' && ch != '\t' {
-			return s
-		}
-		s = s[1:]
-	}
-	return ""
 }

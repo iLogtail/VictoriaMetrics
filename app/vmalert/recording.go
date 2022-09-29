@@ -3,39 +3,42 @@ package main
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"sort"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
+	"github.com/VictoriaMetrics/metrics"
 )
 
 // RecordingRule is a Rule that supposed
 // to evaluate configured Expression and
 // return TimeSeries as result.
 type RecordingRule struct {
-	Type    config.Type
+	Type    datasource.Type
 	RuleID  uint64
 	Name    string
 	Expr    string
 	Labels  map[string]string
 	GroupID uint64
 
-	q datasource.Querier
-
-	// state stores recent state changes
-	// during evaluations
-	state *ruleState
+	// guard status fields
+	mu sync.RWMutex
+	// stores last moment of time Exec was called
+	lastExecTime time.Time
+	// stores last error that happened in Exec func
+	// resets on every successful Exec
+	// may be used as Health state
+	lastExecError error
 
 	metrics *recordingRuleMetrics
 }
 
 type recordingRuleMetrics struct {
-	errors  *utils.Gauge
-	samples *utils.Gauge
+	errors *gauge
 }
 
 // String implements Stringer interface
@@ -49,131 +52,81 @@ func (rr *RecordingRule) ID() uint64 {
 	return rr.RuleID
 }
 
-func newRecordingRule(qb datasource.QuerierBuilder, group *Group, cfg config.Rule) *RecordingRule {
+func newRecordingRule(group *Group, cfg config.Rule) *RecordingRule {
 	rr := &RecordingRule{
-		Type:    group.Type,
+		Type:    cfg.Type,
 		RuleID:  cfg.ID,
 		Name:    cfg.Record,
 		Expr:    cfg.Expr,
 		Labels:  cfg.Labels,
 		GroupID: group.ID(),
 		metrics: &recordingRuleMetrics{},
-		state:   newRuleState(),
-		q: qb.BuildWithParams(datasource.QuerierParams{
-			DataSourceType:     group.Type.String(),
-			EvaluationInterval: group.Interval,
-			QueryParams:        group.Params,
-			Headers:            group.Headers,
-		}),
 	}
 
 	labels := fmt.Sprintf(`recording=%q, group=%q, id="%d"`, rr.Name, group.Name, rr.ID())
-	rr.metrics.errors = utils.GetOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_error{%s}`, labels),
+	rr.metrics.errors = getOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_error{%s}`, labels),
 		func() float64 {
-			e := rr.state.getLast()
-			if e.err == nil {
+			rr.mu.Lock()
+			defer rr.mu.Unlock()
+			if rr.lastExecError == nil {
 				return 0
 			}
 			return 1
-		})
-	rr.metrics.samples = utils.GetOrCreateGauge(fmt.Sprintf(`vmalert_recording_rules_last_evaluation_samples{%s}`, labels),
-		func() float64 {
-			e := rr.state.getLast()
-			return float64(e.samples)
 		})
 	return rr
 }
 
 // Close unregisters rule metrics
 func (rr *RecordingRule) Close() {
-	rr.metrics.errors.Unregister()
-	rr.metrics.samples.Unregister()
-}
-
-// ExecRange executes recording rule on the given time range similarly to Exec.
-// It doesn't update internal states of the Rule and meant to be used just
-// to get time series for backfilling.
-func (rr *RecordingRule) ExecRange(ctx context.Context, start, end time.Time) ([]prompbmarshal.TimeSeries, error) {
-	series, err := rr.q.QueryRange(ctx, rr.Expr, start, end)
-	if err != nil {
-		return nil, err
-	}
-	duplicates := make(map[string]struct{}, len(series))
-	var tss []prompbmarshal.TimeSeries
-	for _, s := range series {
-		ts := rr.toTimeSeries(s)
-		key := stringifyLabels(ts)
-		if _, ok := duplicates[key]; ok {
-			return nil, fmt.Errorf("original metric %v; resulting labels %q: %w", s.Labels, key, errDuplicate)
-		}
-		duplicates[key] = struct{}{}
-		tss = append(tss, ts)
-	}
-	return tss, nil
+	metrics.UnregisterMetric(rr.metrics.errors.name)
 }
 
 // Exec executes RecordingRule expression via the given Querier.
-func (rr *RecordingRule) Exec(ctx context.Context, ts time.Time, limit int) ([]prompbmarshal.TimeSeries, error) {
-	start := time.Now()
-	qMetrics, req, err := rr.q.Query(ctx, rr.Expr, ts)
-	curState := ruleStateEntry{
-		time:     start,
-		at:       ts,
-		duration: time.Since(start),
-		samples:  len(qMetrics),
-		req:      req,
+func (rr *RecordingRule) Exec(ctx context.Context, q datasource.Querier, series bool) ([]prompbmarshal.TimeSeries, error) {
+	if !series {
+		return nil, nil
 	}
 
-	defer func() {
-		rr.state.add(curState)
-	}()
+	qMetrics, err := q.Query(ctx, rr.Expr, rr.Type)
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
 
+	rr.lastExecTime = time.Now()
+	rr.lastExecError = err
 	if err != nil {
-		curState.err = fmt.Errorf("failed to execute query %q: %w", rr.Expr, err)
-		return nil, curState.err
+		return nil, fmt.Errorf("failed to execute query %q: %w", rr.Expr, err)
 	}
 
-	numSeries := len(qMetrics)
-	if limit > 0 && numSeries > limit {
-		curState.err = fmt.Errorf("exec exceeded limit of %d with %d series", limit, numSeries)
-		return nil, curState.err
-	}
-
-	duplicates := make(map[string]struct{}, len(qMetrics))
+	duplicates := make(map[uint64]prompbmarshal.TimeSeries, len(qMetrics))
 	var tss []prompbmarshal.TimeSeries
 	for _, r := range qMetrics {
-		ts := rr.toTimeSeries(r)
-		key := stringifyLabels(ts)
-		if _, ok := duplicates[key]; ok {
-			curState.err = fmt.Errorf("original metric %v; resulting labels %q: %w", r, key, errDuplicate)
-			return nil, curState.err
+		ts := rr.toTimeSeries(r, rr.lastExecTime)
+		h := hashTimeSeries(ts)
+		if _, ok := duplicates[h]; ok {
+			rr.lastExecError = errDuplicate
+			return nil, errDuplicate
 		}
-		duplicates[key] = struct{}{}
+		duplicates[h] = ts
 		tss = append(tss, ts)
 	}
 	return tss, nil
 }
 
-func stringifyLabels(ts prompbmarshal.TimeSeries) string {
+func hashTimeSeries(ts prompbmarshal.TimeSeries) uint64 {
+	hash := fnv.New64a()
 	labels := ts.Labels
-	if len(labels) > 1 {
-		sort.Slice(labels, func(i, j int) bool {
-			return labels[i].Name < labels[j].Name
-		})
+	sort.Slice(labels, func(i, j int) bool {
+		return labels[i].Name < labels[j].Name
+	})
+	for _, l := range labels {
+		hash.Write([]byte(l.Name))
+		hash.Write([]byte(l.Value))
+		hash.Write([]byte("\xff"))
 	}
-	b := strings.Builder{}
-	for i, l := range labels {
-		b.WriteString(l.Name)
-		b.WriteString("=")
-		b.WriteString(l.Value)
-		if i != len(labels)-1 {
-			b.WriteString(",")
-		}
-	}
-	return b.String()
+	return hash.Sum64()
 }
 
-func (rr *RecordingRule) toTimeSeries(m datasource.Metric) prompbmarshal.TimeSeries {
+func (rr *RecordingRule) toTimeSeries(m datasource.Metric, timestamp time.Time) prompbmarshal.TimeSeries {
 	labels := make(map[string]string)
 	for _, l := range m.Labels {
 		labels[l.Name] = l.Value
@@ -183,10 +136,12 @@ func (rr *RecordingRule) toTimeSeries(m datasource.Metric) prompbmarshal.TimeSer
 	for k, v := range rr.Labels {
 		labels[k] = v
 	}
-	return newTimeSeries(m.Values, m.Timestamps, labels)
+	return newTimeSeries(m.Value, labels, timestamp)
 }
 
 // UpdateWith copies all significant fields.
+// alerts state isn't copied since
+// it should be updated in next 2 Execs
 func (rr *RecordingRule) UpdateWith(r Rule) error {
 	nr, ok := r.(*RecordingRule)
 	if !ok {
@@ -194,33 +149,25 @@ func (rr *RecordingRule) UpdateWith(r Rule) error {
 	}
 	rr.Expr = nr.Expr
 	rr.Labels = nr.Labels
-	rr.q = nr.q
 	return nil
 }
 
-// ToAPI returns Rule's representation in form
-// of APIRule
-func (rr *RecordingRule) ToAPI() APIRule {
-	lastState := rr.state.getLast()
-	r := APIRule{
-		Type:           "recording",
-		DatasourceType: rr.Type.String(),
-		Name:           rr.Name,
-		Query:          rr.Expr,
-		Labels:         rr.Labels,
-		LastEvaluation: lastState.time,
-		EvaluationTime: lastState.duration.Seconds(),
-		Health:         "ok",
-		LastSamples:    lastState.samples,
-		Updates:        rr.state.getAll(),
-
+// RuleAPI returns Rule representation in form
+// of APIRecordingRule
+func (rr *RecordingRule) RuleAPI() APIRecordingRule {
+	var lastErr string
+	if rr.lastExecError != nil {
+		lastErr = rr.lastExecError.Error()
+	}
+	return APIRecordingRule{
 		// encode as strings to avoid rounding
-		ID:      fmt.Sprintf("%d", rr.ID()),
-		GroupID: fmt.Sprintf("%d", rr.GroupID),
+		ID:         fmt.Sprintf("%d", rr.ID()),
+		GroupID:    fmt.Sprintf("%d", rr.GroupID),
+		Name:       rr.Name,
+		Type:       rr.Type.String(),
+		Expression: rr.Expr,
+		LastError:  lastErr,
+		LastExec:   rr.lastExecTime,
+		Labels:     rr.Labels,
 	}
-	if lastState.err != nil {
-		r.LastError = lastState.err.Error()
-		r.Health = "err"
-	}
-	return r
 }

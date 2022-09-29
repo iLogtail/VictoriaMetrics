@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 )
 
@@ -80,7 +79,7 @@ type ObjectReference struct {
 
 // EndpointPort implements k8s endpoint port.
 //
-// See https://v1-21.docs.kubernetes.io/docs/reference/generated/kubernetes-api/v1.21/#endpointport-v1-discovery-k8s-io
+// See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#endpointport-v1beta1-discovery-k8s-io
 type EndpointPort struct {
 	AppProtocol string
 	Name        string
@@ -93,7 +92,7 @@ type EndpointPort struct {
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#endpoints
 func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 	var svc *Service
-	if o := gw.getObjectByRoleLocked("service", eps.Metadata.Namespace, eps.Metadata.Name); o != nil {
+	if o := gw.getObjectByRole("service", eps.Metadata.Namespace, eps.Metadata.Name); o != nil {
 		svc = o.(*Service)
 	}
 	podPortsSeen := make(map[*Pod][]int)
@@ -103,14 +102,6 @@ func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 			ms = appendEndpointLabelsForAddresses(ms, gw, podPortsSeen, eps, ess.Addresses, epp, svc, "true")
 			ms = appendEndpointLabelsForAddresses(ms, gw, podPortsSeen, eps, ess.NotReadyAddresses, epp, svc, "false")
 		}
-	}
-	// See https://kubernetes.io/docs/reference/labels-annotations-taints/#endpoints-kubernetes-io-over-capacity
-	// and https://github.com/kubernetes/kubernetes/pull/99975
-	switch eps.Metadata.Annotations.GetByName("endpoints.kubernetes.io/over-capacity") {
-	case "truncated":
-		logger.Warnf(`the number of targets for "role: endpoints" %q exceeds 1000 and has been truncated; please use "role: endpointslice" instead`, eps.Metadata.key())
-	case "warning":
-		logger.Warnf(`the number of targets for "role: endpoints" %q exceeds 1000 and will be truncated in the next k8s releases; please use "role: endpointslice" instead`, eps.Metadata.key())
 	}
 
 	// Append labels for skipped ports on seen pods.
@@ -132,7 +123,7 @@ func (eps *Endpoints) getTargetLabels(gw *groupWatcher) []map[string]string {
 				m := map[string]string{
 					"__address__": addr,
 				}
-				p.appendCommonLabels(m, gw)
+				p.appendCommonLabels(m)
 				p.appendContainerLabels(m, c, &cp)
 				if svc != nil {
 					svc.appendCommonLabels(m)
@@ -149,38 +140,31 @@ func appendEndpointLabelsForAddresses(ms []map[string]string, gw *groupWatcher, 
 	for _, ea := range eas {
 		var p *Pod
 		if ea.TargetRef.Name != "" {
-			if o := gw.getObjectByRoleLocked("pod", ea.TargetRef.Namespace, ea.TargetRef.Name); o != nil {
+			if o := gw.getObjectByRole("pod", ea.TargetRef.Namespace, ea.TargetRef.Name); o != nil {
 				p = o.(*Pod)
 			}
 		}
-		m := getEndpointLabelsForAddressAndPort(gw, podPortsSeen, eps, ea, epp, p, svc, ready)
+		m := getEndpointLabelsForAddressAndPort(podPortsSeen, eps, ea, epp, p, svc, ready)
 		ms = append(ms, m)
 	}
 	return ms
 }
 
-func getEndpointLabelsForAddressAndPort(gw *groupWatcher, podPortsSeen map[*Pod][]int, eps *Endpoints, ea EndpointAddress, epp EndpointPort,
-	p *Pod, svc *Service, ready string) map[string]string {
+func getEndpointLabelsForAddressAndPort(podPortsSeen map[*Pod][]int, eps *Endpoints, ea EndpointAddress, epp EndpointPort, p *Pod, svc *Service, ready string) map[string]string {
 	m := getEndpointLabels(eps.Metadata, ea, epp, ready)
 	if svc != nil {
 		svc.appendCommonLabels(m)
 	}
-	// See https://github.com/prometheus/prometheus/issues/10284
 	eps.Metadata.registerLabelsAndAnnotations("__meta_kubernetes_endpoints", m)
 	if ea.TargetRef.Kind != "Pod" || p == nil {
 		return m
 	}
-	p.appendCommonLabels(m, gw)
-	// always add pod targetRef, even if epp port doesn't match container port
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/2134
-	if _, ok := podPortsSeen[p]; !ok {
-		podPortsSeen[p] = []int{}
-	}
+	p.appendCommonLabels(m)
 	for _, c := range p.Spec.Containers {
 		for _, cp := range c.Ports {
 			if cp.ContainerPort == epp.Port {
-				podPortsSeen[p] = append(podPortsSeen[p], cp.ContainerPort)
 				p.appendContainerLabels(m, c, &cp)
+				podPortsSeen[p] = append(podPortsSeen[p], cp.ContainerPort)
 				break
 			}
 		}

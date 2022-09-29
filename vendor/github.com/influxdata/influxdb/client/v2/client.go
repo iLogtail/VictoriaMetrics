@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"mime"
 	"net"
 	"net/http"
@@ -79,9 +80,6 @@ type Client interface {
 	// Write takes a BatchPoints object and writes all Points to InfluxDB.
 	Write(bp BatchPoints) error
 
-	// WriteCtx takes a BatchPoints object and writes all Points to InfluxDB.
-	WriteCtx(ctx context.Context, bp BatchPoints) error
-
 	// Query makes an InfluxDB Query on the database. This will fail if using
 	// the UDP client.
 	Query(q Query) (*Response, error)
@@ -98,15 +96,9 @@ type Client interface {
 	Close() error
 }
 
-// For added performance users may want to send pre-serialized points.
-type HTTPClient interface {
-	Client
-	WriteRawCtx(ctx context.Context, bp BatchPoints, reqBody io.Reader) error
-}
-
 // NewHTTPClient returns a new Client from the provided config.
 // Client is safe for concurrent use by multiple goroutines.
-func NewHTTPClient(conf HTTPConfig) (HTTPClient, error) {
+func NewHTTPClient(conf HTTPConfig) (Client, error) {
 	if conf.UserAgent == "" {
 		conf.UserAgent = "InfluxDBClient"
 	}
@@ -176,7 +168,7 @@ func (c *client) Ping(timeout time.Duration) (time.Duration, string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return 0, "", err
 	}
@@ -385,10 +377,6 @@ func NewPointFrom(pt models.Point) *Point {
 }
 
 func (c *client) Write(bp BatchPoints) error {
-	return c.WriteCtx(context.Background(), bp)
-}
-
-func (c *client) WriteCtx(ctx context.Context, bp BatchPoints) error {
 	var b bytes.Buffer
 
 	for _, p := range bp.Points() {
@@ -403,15 +391,11 @@ func (c *client) WriteCtx(ctx context.Context, bp BatchPoints) error {
 			return err
 		}
 	}
-	return c.WriteRawCtx(ctx, bp, &b)
-}
 
-// WriteRawCtx uses reqBody instead of parsing bp.Points. Metadata still comes from bp.
-func (c *client) WriteRawCtx(ctx context.Context, bp BatchPoints, reqBody io.Reader) error {
 	u := c.url
 	u.Path = path.Join(u.Path, "write")
 
-	req, err := http.NewRequestWithContext(ctx, "POST", u.String(), reqBody)
+	req, err := http.NewRequest("POST", u.String(), &b)
 	if err != nil {
 		return err
 	}
@@ -434,7 +418,7 @@ func (c *client) WriteRawCtx(ctx context.Context, bp BatchPoints, reqBody io.Rea
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -532,7 +516,7 @@ type Result struct {
 
 // Query sends a command to the server and returns the Response.
 func (c *client) Query(q Query) (*Response, error) {
-	return c.QueryCtx(context.Background(), q)
+	return c.QueryCtx(nil, q)
 }
 
 // QueryCtx sends a command to the server and returns the Response.
@@ -607,7 +591,7 @@ func (c *client) QueryCtx(ctx context.Context, q Query) (*Response, error) {
 
 // QueryAsChunk sends a command to the server and returns the Response.
 func (c *client) QueryAsChunk(q Query) (*ChunkedResponse, error) {
-	req, err := c.createDefaultRequest(context.Background(), q)
+	req, err := c.createDefaultRequest(nil, q)
 	if err != nil {
 		return nil, err
 	}
@@ -633,7 +617,7 @@ func checkResponse(resp *http.Response) error {
 	// but instead some other service. If the error code is also a 500+ code, then some
 	// downstream loadbalancer/proxy/etc had an issue and we should report that.
 	if resp.Header.Get("X-Influxdb-Version") == "" && resp.StatusCode >= http.StatusInternalServerError {
-		body, err := io.ReadAll(resp.Body)
+		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil || len(body) == 0 {
 			return fmt.Errorf("received status code %d from downstream server", resp.StatusCode)
 		}
@@ -646,7 +630,7 @@ func checkResponse(resp *http.Response) error {
 	if cType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); cType != "application/json" {
 		// Read up to 1kb of the body to help identify downstream errors and limit the impact of things
 		// like downstream serving a large file
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		body, err := ioutil.ReadAll(io.LimitReader(resp.Body, 1024))
 		if err != nil || len(body) == 0 {
 			return fmt.Errorf("expected json response, got empty body, with status: %v", resp.StatusCode)
 		}
@@ -730,7 +714,7 @@ type ChunkedResponse struct {
 func NewChunkedResponse(r io.Reader) *ChunkedResponse {
 	rc, ok := r.(io.ReadCloser)
 	if !ok {
-		rc = io.NopCloser(r)
+		rc = ioutil.NopCloser(r)
 	}
 	resp := &ChunkedResponse{}
 	resp.duplex = &duplexReader{r: rc, w: &resp.buf}
@@ -749,7 +733,7 @@ func (r *ChunkedResponse) NextResponse() (*Response, error) {
 		// A decoding error happened. This probably means the server crashed
 		// and sent a last-ditch error message to us. Ensure we have read the
 		// entirety of the connection to get any remaining error text.
-		io.Copy(io.Discard, r.duplex)
+		io.Copy(ioutil.Discard, r.duplex)
 		return nil, errors.New(strings.TrimSpace(r.buf.String()))
 	}
 

@@ -10,7 +10,6 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/persistentqueue"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
@@ -21,9 +20,15 @@ import (
 var (
 	flushInterval = flag.Duration("remoteWrite.flushInterval", time.Second, "Interval for flushing the data to remote storage. "+
 		"This option takes effect only when less than 10K data points per second are pushed to -remoteWrite.url")
-	maxUnpackedBlockSize = flagutil.NewBytes("remoteWrite.maxBlockSize", 8*1024*1024, "The maximum block size to send to remote storage. Bigger blocks may improve performance at the cost of the increased memory usage. See also -remoteWrite.maxRowsPerBlock")
-	maxRowsPerBlock      = flag.Int("remoteWrite.maxRowsPerBlock", 10000, "The maximum number of samples to send in each block to remote storage. Higher number may improve performance at the cost of the increased memory usage. See also -remoteWrite.maxBlockSize")
+	maxUnpackedBlockSize = flagutil.NewBytes("remoteWrite.maxBlockSize", 8*1024*1024, "The maximum size in bytes of unpacked request to send to remote storage. "+
+		"It shouldn't exceed -maxInsertRequestSize from VictoriaMetrics")
 )
+
+// the maximum number of rows to send per each block.
+const maxRowsPerBlock = 10000
+
+// the maximum number of labels to send per each block.
+const maxLabelsPerBlock = 40000
 
 type pendingSeries struct {
 	mu sync.Mutex
@@ -123,6 +128,7 @@ func (wr *writeRequest) reset() {
 }
 
 func (wr *writeRequest) flush() {
+	sortLabelsIfNeeded(wr.tss)
 	wr.wr.Timeseries = wr.tss
 	wr.adjustSampleValues()
 	atomic.StoreUint64(&wr.lastFlushTime, fasttime.UnixTimestamp())
@@ -148,13 +154,10 @@ func (wr *writeRequest) adjustSampleValues() {
 
 func (wr *writeRequest) push(src []prompbmarshal.TimeSeries) {
 	tssDst := wr.tss
-	maxSamplesPerBlock := *maxRowsPerBlock
-	// Allow up to 10x of labels per each block on average.
-	maxLabelsPerBlock := 10 * maxSamplesPerBlock
 	for i := range src {
 		tssDst = append(tssDst, prompbmarshal.TimeSeries{})
 		wr.copyTimeSeries(&tssDst[len(tssDst)-1], &src[i])
-		if len(wr.samples) >= maxSamplesPerBlock || len(wr.labels) >= maxLabelsPerBlock {
+		if len(wr.samples) >= maxRowsPerBlock || len(wr.labels) >= maxLabelsPerBlock {
 			wr.tss = tssDst
 			wr.flush()
 			tssDst = wr.tss
@@ -211,22 +214,7 @@ func pushWriteRequest(wr *prompbmarshal.WriteRequest, pushBlock func(block []byt
 		writeRequestBufPool.Put(bb)
 	}
 
-	// Too big block. Recursively split it into smaller parts if possible.
-	if len(wr.Timeseries) == 1 {
-		// A single time series left. Recursively split its samples into smaller parts if possible.
-		samples := wr.Timeseries[0].Samples
-		if len(samples) == 1 {
-			logger.Warnf("dropping a sample for metric with too long labels exceeding -remoteWrite.maxBlockSize=%d bytes", maxUnpackedBlockSize.N)
-			return
-		}
-		n := len(samples) / 2
-		wr.Timeseries[0].Samples = samples[:n]
-		pushWriteRequest(wr, pushBlock)
-		wr.Timeseries[0].Samples = samples[n:]
-		pushWriteRequest(wr, pushBlock)
-		wr.Timeseries[0].Samples = samples
-		return
-	}
+	// Too big block. Recursively split it into smaller parts.
 	timeseries := wr.Timeseries
 	n := len(timeseries) / 2
 	wr.Timeseries = timeseries[:n]

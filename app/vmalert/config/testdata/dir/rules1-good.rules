@@ -1,7 +1,5 @@
 groups:
   - name: duplicatedGroupDiffFiles
-    labels:
-       dc: gcp
     rules:
       - alert: VMRows
         for: 5m

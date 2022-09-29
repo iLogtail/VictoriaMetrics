@@ -58,7 +58,7 @@ func (pts *partitionSearch) reset() {
 // tsids must be sorted.
 // tsids cannot be modified after the Init call, since it is owned by pts.
 //
-// MustClose must be called when partition search is done.
+/// MustClose must be called when partition search is done.
 func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
 	if pts.needClosing {
 		logger.Panicf("BUG: missing partitionSearch.MustClose call before the next call to Init")
@@ -92,18 +92,22 @@ func (pts *partitionSearch) Init(pt *partition, tsids []TSID, tr TimeRange) {
 	}
 
 	// Initialize the psHeap.
+	var errors []error
 	pts.psHeap = pts.psHeap[:0]
 	for i := range pts.psPool {
 		ps := &pts.psPool[i]
 		if !ps.NextBlock() {
 			if err := ps.Error(); err != nil {
-				// Return only the first error, since it has no sense in returning all errors.
-				pts.err = fmt.Errorf("cannot initialize partition search: %w", err)
-				return
+				errors = append(errors, err)
 			}
 			continue
 		}
 		pts.psHeap = append(pts.psHeap, ps)
+	}
+	if len(errors) > 0 {
+		// Return only the first error, since it has no sense in returning all errors.
+		pts.err = fmt.Errorf("cannot initialize partition search: %w", errors[0])
+		return
 	}
 	if len(pts.psHeap) == 0 {
 		pts.err = io.EOF

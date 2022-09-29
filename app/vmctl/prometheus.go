@@ -5,9 +5,9 @@ import (
 	"log"
 	"sync"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/barpool"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
+	"github.com/cheggaaa/pb/v3"
 	"github.com/prometheus/prometheus/tsdb"
 )
 
@@ -25,7 +25,7 @@ type prometheusProcessor struct {
 	cc int
 }
 
-func (pp *prometheusProcessor) run(silent, verbose bool) error {
+func (pp *prometheusProcessor) run(silent bool) error {
 	blocks, err := pp.cl.Explore()
 	if err != nil {
 		return fmt.Errorf("explore failed: %s", err)
@@ -38,13 +38,7 @@ func (pp *prometheusProcessor) run(silent, verbose bool) error {
 		return nil
 	}
 
-	bar := barpool.AddWithTemplate(fmt.Sprintf(barTpl, "Processing blocks"), len(blocks))
-
-	if err := barpool.Start(); err != nil {
-		return err
-	}
-	defer barpool.Stop()
-
+	bar := pb.StartNew(len(blocks))
 	blockReadersCh := make(chan tsdb.BlockReader)
 	errCh := make(chan error, pp.cc)
 	pp.im.ResetStats()
@@ -63,6 +57,7 @@ func (pp *prometheusProcessor) run(silent, verbose bool) error {
 			}
 		}()
 	}
+
 	// any error breaks the import
 	for _, br := range blocks {
 		select {
@@ -71,7 +66,7 @@ func (pp *prometheusProcessor) run(silent, verbose bool) error {
 			return fmt.Errorf("prometheus error: %s", promErr)
 		case vmErr := <-pp.im.Errors():
 			close(blockReadersCh)
-			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, verbose))
+			return fmt.Errorf("Import process failed: \n%s", wrapErr(vmErr))
 		case blockReadersCh <- br:
 		}
 	}
@@ -80,17 +75,11 @@ func (pp *prometheusProcessor) run(silent, verbose bool) error {
 	wg.Wait()
 	// wait for all buffers to flush
 	pp.im.Close()
-	close(errCh)
 	// drain import errors channel
 	for vmErr := range pp.im.Errors() {
-		if vmErr.Err != nil {
-			return fmt.Errorf("import process failed: %s", wrapErr(vmErr, verbose))
-		}
+		return fmt.Errorf("Import process failed: \n%s", wrapErr(vmErr))
 	}
-	for err := range errCh {
-		return fmt.Errorf("import process failed: %s", err)
-	}
-
+	bar.Finish()
 	log.Println("Import finished!")
 	log.Print(pp.im.Stats())
 	return nil
@@ -131,14 +120,11 @@ func (pp *prometheusProcessor) do(b tsdb.BlockReader) error {
 		if err := it.Err(); err != nil {
 			return err
 		}
-		ts := vm.TimeSeries{
+		pp.im.Input() <- &vm.TimeSeries{
 			Name:       name,
 			LabelPairs: labels,
 			Timestamps: timestamps,
 			Values:     values,
-		}
-		if err := pp.im.Input(&ts); err != nil {
-			return err
 		}
 	}
 	return ss.Err()

@@ -3,6 +3,7 @@ package fsremote
 import (
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -217,7 +218,7 @@ func (fs *FS) CreateFile(filePath string, data []byte) error {
 	if err := fs.mkdirAll(path); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := ioutil.WriteFile(path, data, 0600); err != nil {
 		return fmt.Errorf("cannot write %d bytes to %q: %w", len(data), path, err)
 	}
 	return nil

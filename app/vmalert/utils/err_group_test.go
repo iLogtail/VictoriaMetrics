@@ -2,7 +2,6 @@ package utils
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 )
 
@@ -36,30 +35,4 @@ func TestErrGroup(t *testing.T) {
 			t.Fatalf("expected to have: \n%q\ngot:\n%q", tc.exp, eg.Error())
 		}
 	}
-}
-
-// TestErrGroupConcurrent supposed to test concurrent
-// use of error group.
-// Should be executed with -race flag
-func TestErrGroupConcurrent(t *testing.T) {
-	eg := new(ErrGroup)
-
-	const writersN = 4
-	payload := make(chan error, writersN)
-	for i := 0; i < writersN; i++ {
-		go func() {
-			for err := range payload {
-				eg.Add(err)
-			}
-		}()
-	}
-
-	const iterations = 500
-	for i := 0; i < iterations; i++ {
-		payload <- fmt.Errorf("error %d", i)
-		if i%10 == 0 {
-			_ = eg.Err()
-		}
-	}
-	close(payload)
 }

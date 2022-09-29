@@ -11,23 +11,20 @@ import (
 //
 // See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config
 type SDConfig struct {
-	Server     string           `yaml:"server,omitempty"`
-	Token      *promauth.Secret `yaml:"token"`
-	Datacenter string           `yaml:"datacenter"`
-	// Namespace only supported at enterprise consul.
-	// https://www.consul.io/docs/enterprise/namespaces
-	Namespace         string                     `yaml:"namespace,omitempty"`
+	Server            string                     `yaml:"server,omitempty"`
+	Token             *string                    `yaml:"token"`
+	Datacenter        string                     `yaml:"datacenter"`
 	Scheme            string                     `yaml:"scheme,omitempty"`
 	Username          string                     `yaml:"username"`
-	Password          *promauth.Secret           `yaml:"password"`
-	HTTPClientConfig  promauth.HTTPClientConfig  `yaml:",inline"`
-	ProxyURL          *proxy.URL                 `yaml:"proxy_url,omitempty"`
+	Password          string                     `yaml:"password"`
+	ProxyURL          proxy.URL                  `yaml:"proxy_url,omitempty"`
 	ProxyClientConfig promauth.ProxyClientConfig `yaml:",inline"`
+	TLSConfig         *promauth.TLSConfig        `yaml:"tls_config,omitempty"`
 	Services          []string                   `yaml:"services,omitempty"`
 	Tags              []string                   `yaml:"tags,omitempty"`
 	NodeMeta          map[string]string          `yaml:"node_meta,omitempty"`
 	TagSeparator      *string                    `yaml:"tag_separator,omitempty"`
-	AllowStale        *bool                      `yaml:"allow_stale,omitempty"`
+	AllowStale        bool                       `yaml:"allow_stale,omitempty"`
 	// RefreshInterval time.Duration `yaml:"refresh_interval"`
 	// refresh_interval is obtained from `-promscrape.consulSDCheckInterval` command-line option.
 }

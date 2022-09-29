@@ -3,8 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
+	"path"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vminsert"
@@ -19,16 +21,16 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 )
 
 var (
 	httpListenAddr    = flag.String("httpListenAddr", ":8428", "TCP address to listen for http connections")
-	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Leave only the last sample in every time series per each discrete interval "+
-		"equal to -dedup.minScrapeInterval > 0. See https://docs.victoriametrics.com/#deduplication and https://docs.victoriametrics.com/#downsampling")
+	minScrapeInterval = flag.Duration("dedup.minScrapeInterval", 0, "Remove superflouos samples from time series if they are located closer to each other than this duration. "+
+		"This may be useful for reducing overhead when multiple identically configured Prometheus instances write data to the same VictoriaMetrics. "+
+		"Deduplication is disabled if the -dedup.minScrapeInterval is 0")
 	dryRun = flag.Bool("dryRun", false, "Whether to check only -promscrape.config and then exit. "+
-		"Unknown config entries aren't allowed in -promscrape.config by default. This can be changed with -promscrape.config.strictParse=false command-line flag")
+		"Unknown config entries are allowed in -promscrape.config by default. This can be changed with -promscrape.config.strictParse")
 )
 
 func main() {
@@ -38,7 +40,6 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	pushmetrics.Init()
 
 	if promscrape.IsDryRun() {
 		*dryRun = true
@@ -53,7 +54,7 @@ func main() {
 
 	logger.Infof("starting VictoriaMetrics at %q...", *httpListenAddr)
 	startTime := time.Now()
-	storage.SetDedupInterval(*minScrapeInterval)
+	storage.SetMinScrapeIntervalForDeduplication(*minScrapeInterval)
 	vmstorage.Init(promql.ResetRollupResultCacheIfNeeded)
 	vmselect.Init()
 	vminsert.Init()
@@ -88,21 +89,14 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 		if r.Method != "GET" {
 			return false
 		}
-		w.Header().Add("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, "<h2>Single-node VictoriaMetrics</h2></br>")
-		fmt.Fprintf(w, "See docs at <a href='https://docs.victoriametrics.com/'>https://docs.victoriametrics.com/</a></br>")
-		fmt.Fprintf(w, "Useful endpoints:</br>")
-		httpserver.WriteAPIHelp(w, [][2]string{
-			{"vmui", "Web UI"},
-			{"targets", "status for discovered active targets"},
-			{"service-discovery", "labels before and after relabeling for discovered targets"},
-			{"api/v1/targets", "advanced information about discovered targets in JSON format"},
-			{"config", "-promscrape.config contents"},
-			{"metrics", "available service metrics"},
-			{"flags", "command-line flags"},
-			{"api/v1/status/tsdb", "tsdb status page"},
-			{"api/v1/status/top_queries", "top queries"},
-			{"api/v1/status/active_queries", "active queries"},
+		fmt.Fprintf(w, "<h2>Single-node VictoriaMetrics.</h2></br>")
+		fmt.Fprintf(w, "See docs at <a href='https://victoriametrics.github.io/'>https://victoriametrics.github.io/</a></br>")
+		fmt.Fprintf(w, "Useful endpoints: </br>")
+		writeAPIHelp(w, [][]string{
+			{"/targets", "discovered targets list"},
+			{"/api/v1/targets", "advanced information about discovered targets in JSON format"},
+			{"/metrics", "available service metrics"},
+			{"/api/v1/status/tsdb", "tsdb status page"},
 		})
 		return true
 	}
@@ -118,11 +112,20 @@ func requestHandler(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+func writeAPIHelp(w io.Writer, pathList [][]string) {
+	pathPrefix := httpserver.GetPathPrefix()
+	for _, p := range pathList {
+		p, doc := p[0], p[1]
+		p = path.Join(pathPrefix, p)
+		fmt.Fprintf(w, "<a href='%s'>%q</a> - %s<br/>", p, p, doc)
+	}
+}
+
 func usage() {
 	const s = `
 victoria-metrics is a time series database and monitoring solution.
 
-See the docs at https://docs.victoriametrics.com/
+See the docs at https://victoriametrics.github.io/
 `
 	flagutil.Usage(s)
 }

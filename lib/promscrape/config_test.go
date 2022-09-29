@@ -1,124 +1,17 @@
 package promscrape
 
 import (
-	"bytes"
+	"crypto/tls"
 	"fmt"
 	"reflect"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discovery/gce"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/proxy"
 )
-
-func TestMergeLabels(t *testing.T) {
-	f := func(swc *scrapeWorkConfig, target string, extraLabels, metaLabels map[string]string, resultExpected string) {
-		t.Helper()
-		var labels []prompbmarshal.Label
-		labels = mergeLabels(labels[:0], swc, target, extraLabels, metaLabels)
-		result := promLabelsString(labels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result;\ngot\n%s\nwant\n%s", result, resultExpected)
-		}
-	}
-	f(&scrapeWorkConfig{}, "foo", nil, nil, `{__address__="foo",__metrics_path__="",__scheme__="",__scrape_interval__="",__scrape_timeout__="",job=""}`)
-	f(&scrapeWorkConfig{}, "foo", map[string]string{"foo": "bar"}, nil, `{__address__="foo",__metrics_path__="",__scheme__="",__scrape_interval__="",__scrape_timeout__="",foo="bar",job=""}`)
-	f(&scrapeWorkConfig{}, "foo", map[string]string{"job": "bar"}, nil, `{__address__="foo",__metrics_path__="",__scheme__="",__scrape_interval__="",__scrape_timeout__="",job="bar"}`)
-	f(&scrapeWorkConfig{
-		jobName:              "xyz",
-		scheme:               "https",
-		metricsPath:          "/foo/bar",
-		scrapeIntervalString: "15s",
-		scrapeTimeoutString:  "10s",
-		externalLabels: map[string]string{
-			"job": "bar",
-			"a":   "b",
-		},
-	}, "foo", nil, nil, `{__address__="foo",__metrics_path__="/foo/bar",__scheme__="https",__scrape_interval__="15s",__scrape_timeout__="10s",a="b",job="xyz"}`)
-	f(&scrapeWorkConfig{
-		jobName:     "xyz",
-		scheme:      "https",
-		metricsPath: "/foo/bar",
-		externalLabels: map[string]string{
-			"job": "bar",
-			"a":   "b",
-		},
-	}, "foo", map[string]string{
-		"job": "extra_job",
-		"foo": "extra_foo",
-		"a":   "xyz",
-	}, map[string]string{
-		"__meta_x": "y",
-	}, `{__address__="foo",__meta_x="y",__metrics_path__="/foo/bar",__scheme__="https",__scrape_interval__="",__scrape_timeout__="",a="xyz",foo="extra_foo",job="extra_job"}`)
-}
-
-func TestScrapeConfigUnmarshalMarshal(t *testing.T) {
-	f := func(data string) {
-		t.Helper()
-		var cfg Config
-		data = strings.TrimSpace(data)
-		if err := cfg.unmarshal([]byte(data), true); err != nil {
-			t.Fatalf("parse error: %s\ndata:\n%s", err, data)
-		}
-		resultData := string(cfg.marshal())
-		result := strings.TrimSpace(resultData)
-		if result != data {
-			t.Fatalf("unexpected marshaled config:\ngot\n%s\nwant\n%s", result, data)
-		}
-	}
-	f(`
-global:
-  scrape_interval: 10s
-`)
-	f(`
-scrape_config_files:
-- foo
-- bar
-`)
-	f(`
-scrape_configs:
-- job_name: foo
-  scrape_timeout: 1.5s
-  static_configs:
-  - targets:
-    - foo
-    - bar
-    labels:
-      foo: bar
-`)
-	f(`
-scrape_configs:
-- job_name: foo
-  honor_labels: true
-  honor_timestamps: false
-  scheme: https
-  params:
-    foo:
-    - x
-  authorization:
-    type: foobar
-  headers:
-  - 'TenantID: fooBar'
-  - 'X: y:z'
-  relabel_configs:
-  - source_labels: [abc]
-  static_configs:
-  - targets:
-    - foo
-  relabel_debug: true
-  scrape_align_interval: 1h30m0s
-  proxy_bearer_token_file: file.txt
-  proxy_headers:
-  - 'My-Auth-Header: top-secret'
-`)
-
-}
 
 func TestNeedSkipScrapeWork(t *testing.T) {
 	f := func(key string, membersCount, replicationFactor, memberNum int, needSkipExpected bool) {
@@ -175,50 +68,30 @@ func TestLoadStaticConfigs(t *testing.T) {
 }
 
 func TestLoadConfig(t *testing.T) {
-	cfg, data, err := loadConfig("testdata/prometheus.yml")
+	cfg, _, err := loadConfig("testdata/prometheus.yml")
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}
 	if cfg == nil {
 		t.Fatalf("expecting non-nil config")
-	}
-	if data == nil {
-		t.Fatalf("expecting non-nil data")
-	}
-
-	cfg, data, err = loadConfig("testdata/prometheus-with-scrape-config-files.yml")
-	if err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
-	if cfg == nil {
-		t.Fatalf("expecting non-nil config")
-	}
-	if data == nil {
-		t.Fatalf("expecting non-nil data")
 	}
 
 	// Try loading non-existing file
-	cfg, data, err = loadConfig("testdata/non-existing-file")
+	cfg, _, err = loadConfig("testdata/non-existing-file")
 	if err == nil {
 		t.Fatalf("expecting non-nil error")
 	}
 	if cfg != nil {
 		t.Fatalf("unexpected non-nil config: %#v", cfg)
-	}
-	if data != nil {
-		t.Fatalf("unexpected data wit length=%d: %q", len(data), data)
 	}
 
 	// Try loading invalid file
-	cfg, data, err = loadConfig("testdata/file_sd_1.yml")
+	cfg, _, err = loadConfig("testdata/file_sd_1.yml")
 	if err == nil {
 		t.Fatalf("expecting non-nil error")
 	}
 	if cfg != nil {
 		t.Fatalf("unexpected non-nil config: %#v", cfg)
-	}
-	if data != nil {
-		t.Fatalf("unexpected data wit length=%d: %q", len(data), data)
 	}
 }
 
@@ -242,20 +115,15 @@ scrape_configs:
         replacement: black:9115  # The blackbox exporter's real hostname:port.%
 `
 	var cfg Config
-	allData, err := cfg.parseData([]byte(data), "sss")
-	if err != nil {
+	if err := cfg.parse([]byte(data), "sss"); err != nil {
 		t.Fatalf("cannot parase data: %s", err)
-	}
-	if string(allData) != data {
-		t.Fatalf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, data)
 	}
 	sws := cfg.getStaticScrapeWork()
 	resetNonEssentialFields(sws)
 	swsExpected := []*ScrapeWork{{
-		ScrapeURL:       "http://black:9115/probe?module=dns_udp_example&target=8.8.8.8",
-		ScrapeInterval:  defaultScrapeInterval,
-		ScrapeTimeout:   defaultScrapeTimeout,
-		HonorTimestamps: true,
+		ScrapeURL:      "http://black:9115/probe?module=dns_udp_example&target=8.8.8.8",
+		ScrapeInterval: defaultScrapeInterval,
+		ScrapeTimeout:  defaultScrapeTimeout,
 		Labels: []prompbmarshal.Label{
 			{
 				Name:  "__address__",
@@ -278,14 +146,6 @@ scrape_configs:
 				Value: "http",
 			},
 			{
-				Name:  "__scrape_interval__",
-				Value: "1m0s",
-			},
-			{
-				Name:  "__scrape_timeout__",
-				Value: "10s",
-			},
-			{
 				Name:  "instance",
 				Value: "8.8.8.8",
 			},
@@ -299,7 +159,7 @@ scrape_configs:
 		jobNameOriginal: "blackbox",
 	}}
 	if !reflect.DeepEqual(sws, swsExpected) {
-		t.Fatalf("unexpected scrapeWork;\ngot\n%#v\nwant\n%#v", sws, swsExpected)
+		t.Fatalf("unexpected scrapeWork;\ngot\n%+v\nwant\n%+v", sws, swsExpected)
 	}
 }
 
@@ -311,12 +171,8 @@ scrape_configs:
   - files: [testdata/file_sd.json]
 `
 	var cfg Config
-	allData, err := cfg.parseData([]byte(data), "sss")
-	if err != nil {
+	if err := cfg.parse([]byte(data), "sss"); err != nil {
 		t.Fatalf("cannot parase data: %s", err)
-	}
-	if string(allData) != data {
-		t.Fatalf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, data)
 	}
 	sws := cfg.getFileSDScrapeWork(nil)
 	if !equalStaticConfigForScrapeWorks(sws, sws) {
@@ -331,12 +187,8 @@ scrape_configs:
   - files: [testdata/file_sd_1.yml]
 `
 	var cfgNew Config
-	allData, err = cfgNew.parseData([]byte(dataNew), "sss")
-	if err != nil {
+	if err := cfgNew.parse([]byte(dataNew), "sss"); err != nil {
 		t.Fatalf("cannot parse data: %s", err)
-	}
-	if string(allData) != dataNew {
-		t.Fatalf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, dataNew)
 	}
 	swsNew := cfgNew.getFileSDScrapeWork(sws)
 	if equalStaticConfigForScrapeWorks(swsNew, sws) {
@@ -350,12 +202,8 @@ scrape_configs:
   file_sd_configs:
   - files: [testdata/prometheus.yml]
 `
-	allData, err = cfg.parseData([]byte(data), "sss")
-	if err != nil {
+	if err := cfg.parse([]byte(data), "sss"); err != nil {
 		t.Fatalf("cannot parse data: %s", err)
-	}
-	if string(allData) != data {
-		t.Fatalf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, data)
 	}
 	sws = cfg.getFileSDScrapeWork(swsNew)
 	if len(sws) != 0 {
@@ -369,12 +217,8 @@ scrape_configs:
   file_sd_configs:
   - files: [testdata/empty_target_file_sd.yml]
 `
-	allData, err = cfg.parseData([]byte(data), "sss")
-	if err != nil {
+	if err := cfg.parse([]byte(data), "sss"); err != nil {
 		t.Fatalf("cannot parse data: %s", err)
-	}
-	if string(allData) != data {
-		t.Fatalf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, data)
 	}
 	sws = cfg.getFileSDScrapeWork(swsNew)
 	if len(sws) != 0 {
@@ -384,24 +228,16 @@ scrape_configs:
 
 func getFileSDScrapeWork(data []byte, path string) ([]*ScrapeWork, error) {
 	var cfg Config
-	allData, err := cfg.parseData(data, path)
-	if err != nil {
+	if err := cfg.parse(data, path); err != nil {
 		return nil, fmt.Errorf("cannot parse data: %w", err)
-	}
-	if !bytes.Equal(allData, data) {
-		return nil, fmt.Errorf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, data)
 	}
 	return cfg.getFileSDScrapeWork(nil), nil
 }
 
 func getStaticScrapeWork(data []byte, path string) ([]*ScrapeWork, error) {
 	var cfg Config
-	allData, err := cfg.parseData(data, path)
-	if err != nil {
+	if err := cfg.parse(data, path); err != nil {
 		return nil, fmt.Errorf("cannot parse data: %w", err)
-	}
-	if !bytes.Equal(allData, data) {
-		return nil, fmt.Errorf("invalid data returned from parseData;\ngot\n%s\nwant\n%s", allData, data)
 	}
 	return cfg.getStaticScrapeWork(), nil
 }
@@ -426,17 +262,6 @@ func TestGetStaticScrapeWorkFailure(t *testing.T) {
 scrape_configs:
 - static_configs:
   - targets: ["foo"]
-`)
-
-	// Duplicate job_name
-	f(`
-scrape_configs:
-- job_name: foo
-  static_configs:
-    targets: ["foo"]
-- job_name: foo
-  static_configs:
-    targets: ["bar"]
 `)
 
 	// Invalid scheme
@@ -476,7 +301,7 @@ scrape_configs:
 - job_name: x
   basic_auth:
     username: foobar
-    password_file: ['foobar']
+    password_file: /non_existing_file.pass
   static_configs:
   - targets: ["a"]
 `)
@@ -530,7 +355,7 @@ scrape_configs:
 	f(`
 scrape_configs:
 - job_name: x
-  bearer_token_file: [foobar]
+  bearer_token_file: non_existing_file.bearer
   static_configs:
   - targets: ["a"]
 `)
@@ -663,14 +488,6 @@ scrape_configs:
   static_configs:
   - targets: ["s"]
 `)
-
-	// Invalid scrape_config_files contents
-	f(`
-scrape_config_files:
-- job_name: aa
-  static_configs:
-  - targets: ["s"]
-`)
 }
 
 func resetNonEssentialFields(sws []*ScrapeWork) {
@@ -723,7 +540,8 @@ scrape_configs:
 			ScrapeURL:       "http://host1:80/abc/de",
 			ScrapeInterval:  defaultScrapeInterval,
 			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			HonorLabels:     false,
+			HonorTimestamps: false,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -736,14 +554,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "__vm_filepath",
@@ -770,7 +580,8 @@ scrape_configs:
 			ScrapeURL:       "http://host2:80/abc/de",
 			ScrapeInterval:  defaultScrapeInterval,
 			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			HonorLabels:     false,
+			HonorTimestamps: false,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -783,14 +594,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "__vm_filepath",
@@ -817,7 +620,8 @@ scrape_configs:
 			ScrapeURL:       "http://localhost:9090/abc/de",
 			ScrapeInterval:  defaultScrapeInterval,
 			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			HonorLabels:     false,
+			HonorTimestamps: false,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -830,14 +634,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "__vm_filepath",
@@ -886,7 +682,8 @@ scrape_configs:
 			ScrapeURL:       "http://foo.bar:1234/metrics",
 			ScrapeInterval:  defaultScrapeInterval,
 			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			HonorLabels:     false,
+			HonorTimestamps: false,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -899,14 +696,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "instance",
@@ -936,7 +725,8 @@ scrape_configs:
 			ScrapeURL:       "http://foo.bar:1234/metrics",
 			ScrapeInterval:  defaultScrapeInterval,
 			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			HonorLabels:     false,
+			HonorTimestamps: false,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -949,14 +739,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "datacenter",
@@ -986,38 +768,47 @@ global:
   scrape_timeout: 34s
 scrape_configs:
 - job_name: foo
-  scrape_interval: 54s
+  scrape_interval: 543s
   scrape_timeout: 12s
   metrics_path: /foo/bar
   scheme: https
   honor_labels: true
-  honor_timestamps: false
+  honor_timestamps: true
   follow_redirects: false
   params:
     p: ["x&y", "="]
     xaa:
+  bearer_token: xyz
   proxy_url: http://foo.bar
+  proxy_basic_auth:
+    username: foo
+    password: bar
   static_configs:
   - targets: ["foo.bar", "aaa"]
     labels:
       x: y
-      __scrape_timeout__: "5s"
 - job_name: qwer
+  basic_auth:
+    username: user
+    password: pass
   tls_config:
     server_name: foobar
     insecure_skip_verify: true
   static_configs:
   - targets: [1.2.3.4]
 - job_name: asdf
+  authorization:
+    type: xyz
+    credentials: abc
   static_configs:
   - targets: [foobar]
 `, []*ScrapeWork{
 		{
 			ScrapeURL:       "https://foo.bar:443/foo/bar?p=x%26y&p=%3D",
-			ScrapeInterval:  54 * time.Second,
-			ScrapeTimeout:   5 * time.Second,
+			ScrapeInterval:  543 * time.Second,
+			ScrapeTimeout:   12 * time.Second,
 			HonorLabels:     true,
-			HonorTimestamps: false,
+			HonorTimestamps: true,
 			DenyRedirects:   true,
 			Labels: []prompbmarshal.Label{
 				{
@@ -1037,14 +828,6 @@ scrape_configs:
 					Value: "https",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "54s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "5s",
-				},
-				{
 					Name:  "instance",
 					Value: "foo.bar:443",
 				},
@@ -1057,17 +840,21 @@ scrape_configs:
 					Value: "y",
 				},
 			},
-			AuthConfig:      &promauth.Config{},
-			ProxyAuthConfig: &promauth.Config{},
+			AuthConfig: &promauth.Config{
+				Authorization: "Bearer xyz",
+			},
+			ProxyAuthConfig: &promauth.Config{
+				Authorization: "Basic Zm9vOmJhcg==",
+			},
 			ProxyURL:        proxy.MustNewURL("http://foo.bar"),
 			jobNameOriginal: "foo",
 		},
 		{
 			ScrapeURL:       "https://aaa:443/foo/bar?p=x%26y&p=%3D",
-			ScrapeInterval:  54 * time.Second,
-			ScrapeTimeout:   5 * time.Second,
+			ScrapeInterval:  543 * time.Second,
+			ScrapeTimeout:   12 * time.Second,
 			HonorLabels:     true,
-			HonorTimestamps: false,
+			HonorTimestamps: true,
 			DenyRedirects:   true,
 			Labels: []prompbmarshal.Label{
 				{
@@ -1087,14 +874,6 @@ scrape_configs:
 					Value: "https",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "54s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "5s",
-				},
-				{
 					Name:  "instance",
 					Value: "aaa:443",
 				},
@@ -1107,16 +886,19 @@ scrape_configs:
 					Value: "y",
 				},
 			},
-			AuthConfig:      &promauth.Config{},
-			ProxyAuthConfig: &promauth.Config{},
+			AuthConfig: &promauth.Config{
+				Authorization: "Bearer xyz",
+			},
+			ProxyAuthConfig: &promauth.Config{
+				Authorization: "Basic Zm9vOmJhcg==",
+			},
 			ProxyURL:        proxy.MustNewURL("http://foo.bar"),
 			jobNameOriginal: "foo",
 		},
 		{
-			ScrapeURL:       "http://1.2.3.4:80/metrics",
-			ScrapeInterval:  8 * time.Second,
-			ScrapeTimeout:   8 * time.Second,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://1.2.3.4:80/metrics",
+			ScrapeInterval: 8 * time.Second,
+			ScrapeTimeout:  34 * time.Second,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1131,14 +913,6 @@ scrape_configs:
 					Value: "http",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "8s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "8s",
-				},
-				{
 					Name:  "instance",
 					Value: "1.2.3.4:80",
 				},
@@ -1148,6 +922,7 @@ scrape_configs:
 				},
 			},
 			AuthConfig: &promauth.Config{
+				Authorization:         "Basic dXNlcjpwYXNz",
 				TLSServerName:         "foobar",
 				TLSInsecureSkipVerify: true,
 			},
@@ -1155,10 +930,9 @@ scrape_configs:
 			jobNameOriginal: "qwer",
 		},
 		{
-			ScrapeURL:       "http://foobar:80/metrics",
-			ScrapeInterval:  8 * time.Second,
-			ScrapeTimeout:   8 * time.Second,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foobar:80/metrics",
+			ScrapeInterval: 8 * time.Second,
+			ScrapeTimeout:  34 * time.Second,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1173,14 +947,6 @@ scrape_configs:
 					Value: "http",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "8s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "8s",
-				},
-				{
 					Name:  "instance",
 					Value: "foobar:80",
 				},
@@ -1189,7 +955,9 @@ scrape_configs:
 					Value: "asdf",
 				},
 			},
-			AuthConfig:      &promauth.Config{},
+			AuthConfig: &promauth.Config{
+				Authorization: "xyz abc",
+			},
 			ProxyAuthConfig: &promauth.Config{},
 			jobNameOriginal: "asdf",
 		},
@@ -1231,10 +999,9 @@ scrape_configs:
   - targets: ["foo.bar:1234", "drop-this-target"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://foo.bar:1234/metrics?x=keep_me",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foo.bar:1234/metrics?x=keep_me",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1251,14 +1018,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "hash",
@@ -1311,10 +1070,9 @@ scrape_configs:
   - targets: ["foo.bar:1234"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "mailto://foo.bar:1234/abc.de?a=b",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "mailto://foo.bar:1234/abc.de?a=b",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1331,14 +1089,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "mailto",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "instance",
@@ -1376,10 +1126,9 @@ scrape_configs:
   - targets: ["foo.bar:1234", "xyz"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://foo.bar:1234/metrics",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foo.bar:1234/metrics",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1410,10 +1159,9 @@ scrape_configs:
   - targets: ["foo.bar:1234"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://foo.bar:1234/metrics",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foo.bar:1234/metrics",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1426,14 +1174,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "instance",
@@ -1456,14 +1196,16 @@ scrape_configs:
 	f(`
 scrape_configs:
 - job_name: foo
+  basic_auth:
+    username: xyz
+    password_file: testdata/password.txt
   static_configs:
   - targets: ["foo.bar:1234"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://foo.bar:1234/metrics",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foo.bar:1234/metrics",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1478,14 +1220,6 @@ scrape_configs:
 					Value: "http",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
-				},
-				{
 					Name:  "instance",
 					Value: "foo.bar:1234",
 				},
@@ -1494,7 +1228,9 @@ scrape_configs:
 					Value: "foo",
 				},
 			},
-			AuthConfig:      &promauth.Config{},
+			AuthConfig: &promauth.Config{
+				Authorization: "Basic eHl6OnNlY3JldC1wYXNz",
+			},
 			ProxyAuthConfig: &promauth.Config{},
 			jobNameOriginal: "foo",
 		},
@@ -1502,14 +1238,14 @@ scrape_configs:
 	f(`
 scrape_configs:
 - job_name: foo
+  bearer_token_file: testdata/password.txt
   static_configs:
   - targets: ["foo.bar:1234"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://foo.bar:1234/metrics",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foo.bar:1234/metrics",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1524,12 +1260,50 @@ scrape_configs:
 					Value: "http",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
+					Name:  "instance",
+					Value: "foo.bar:1234",
 				},
 				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
+					Name:  "job",
+					Value: "foo",
+				},
+			},
+			AuthConfig: &promauth.Config{
+				Authorization: "Bearer secret-pass",
+			},
+			ProxyAuthConfig: &promauth.Config{},
+			jobNameOriginal: "foo",
+		},
+	})
+	snakeoilCert, err := tls.LoadX509KeyPair("testdata/ssl-cert-snakeoil.pem", "testdata/ssl-cert-snakeoil.key")
+	if err != nil {
+		t.Fatalf("cannot load snakeoil cert: %s", err)
+	}
+	f(`
+scrape_configs:
+- job_name: foo
+  tls_config:
+    cert_file: testdata/ssl-cert-snakeoil.pem
+    key_file: testdata/ssl-cert-snakeoil.key
+  static_configs:
+  - targets: ["foo.bar:1234"]
+`, []*ScrapeWork{
+		{
+			ScrapeURL:      "http://foo.bar:1234/metrics",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
+			Labels: []prompbmarshal.Label{
+				{
+					Name:  "__address__",
+					Value: "foo.bar:1234",
+				},
+				{
+					Name:  "__metrics_path__",
+					Value: "/metrics",
+				},
+				{
+					Name:  "__scheme__",
+					Value: "http",
 				},
 				{
 					Name:  "instance",
@@ -1540,7 +1314,9 @@ scrape_configs:
 					Value: "foo",
 				},
 			},
-			AuthConfig:      &promauth.Config{},
+			AuthConfig: &promauth.Config{
+				TLSCertificate: &snakeoilCert,
+			},
 			ProxyAuthConfig: &promauth.Config{},
 			jobNameOriginal: "foo",
 		},
@@ -1566,10 +1342,9 @@ scrape_configs:
       job: yyy
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://pp:80/metrics?a=c&a=xy",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://pp:80/metrics?a=c&a=xy",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1586,14 +1361,6 @@ scrape_configs:
 				{
 					Name:  "__scheme__",
 					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
 				},
 				{
 					Name:  "foo",
@@ -1617,31 +1384,13 @@ scrape_configs:
 			jobNameOriginal: "aaa",
 		},
 	})
-
-	opts := &promauth.Options{
-		Headers: []string{"My-Auth: foo-Bar"},
-	}
-	ac, err := opts.NewConfig()
-	if err != nil {
-		t.Fatalf("unexpected error when creating promauth.Config: %s", err)
-	}
-	opts = &promauth.Options{
-		Headers: []string{"Foo:bar"},
-	}
-	proxyAC, err := opts.NewConfig()
-	if err != nil {
-		t.Fatalf("unexpected error when creating promauth.Config for proxy: %s", err)
-	}
 	f(`
 scrape_configs:
   - job_name: 'snmp'
     sample_limit: 100
     disable_keepalive: true
     disable_compression: true
-    headers:
-    - "My-Auth: foo-Bar"
-    proxy_headers:
-    - "Foo: bar"
+    stream_parse: true
     scrape_align_interval: 1s
     scrape_offset: 0.5s
     static_configs:
@@ -1657,16 +1406,11 @@ scrape_configs:
         target_label: instance
       - target_label: __address__
         replacement: 127.0.0.1:9116  # The SNMP exporter's real hostname:port.
-      - target_label: __series_limit__
-        replacement: 1234
-      - target_label: __stream_parse__
-        replacement: true
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://127.0.0.1:9116/snmp?module=if_mib&target=192.168.1.2",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://127.0.0.1:9116/snmp?module=if_mib&target=192.168.1.2",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1689,22 +1433,6 @@ scrape_configs:
 					Value: "http",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
-				},
-				{
-					Name:  "__series_limit__",
-					Value: "1234",
-				},
-				{
-					Name:  "__stream_parse__",
-					Value: "true",
-				},
-				{
 					Name:  "instance",
 					Value: "192.168.1.2",
 				},
@@ -1713,15 +1441,14 @@ scrape_configs:
 					Value: "snmp",
 				},
 			},
-			AuthConfig:          ac,
-			ProxyAuthConfig:     proxyAC,
+			AuthConfig:          &promauth.Config{},
+			ProxyAuthConfig:     &promauth.Config{},
 			SampleLimit:         100,
 			DisableKeepAlive:    true,
 			DisableCompression:  true,
 			StreamParse:         true,
 			ScrapeAlignInterval: time.Second,
 			ScrapeOffset:        500 * time.Millisecond,
-			SeriesLimit:         1234,
 			jobNameOriginal:     "snmp",
 		},
 	})
@@ -1735,10 +1462,9 @@ scrape_configs:
     target_label: __metrics_path__
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://foo.bar:1234/metricspath",
-			ScrapeInterval:  defaultScrapeInterval,
-			ScrapeTimeout:   defaultScrapeTimeout,
-			HonorTimestamps: true,
+			ScrapeURL:      "http://foo.bar:1234/metricspath",
+			ScrapeInterval: defaultScrapeInterval,
+			ScrapeTimeout:  defaultScrapeTimeout,
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "__address__",
@@ -1753,14 +1479,6 @@ scrape_configs:
 					Value: "http",
 				},
 				{
-					Name:  "__scrape_interval__",
-					Value: "1m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "10s",
-				},
-				{
 					Name:  "instance",
 					Value: "foo.bar:1234",
 				},
@@ -1772,59 +1490,6 @@ scrape_configs:
 			jobNameOriginal: "path wo slash",
 			AuthConfig:      &promauth.Config{},
 			ProxyAuthConfig: &promauth.Config{},
-		},
-	})
-	f(`
-global:
-  scrape_timeout: 1d
-scrape_configs:
-- job_name: foo
-  scrape_interval: 1w
-  scrape_align_interval: 1d
-  scrape_offset: 2d
-  static_configs:
-  - targets: ["foo.bar:1234"]
-`, []*ScrapeWork{
-		{
-			ScrapeURL:           "http://foo.bar:1234/metrics",
-			ScrapeInterval:      time.Hour * 24 * 7,
-			ScrapeTimeout:       time.Hour * 24,
-			ScrapeAlignInterval: time.Hour * 24,
-			ScrapeOffset:        time.Hour * 24 * 2,
-			HonorTimestamps:     true,
-			Labels: []prompbmarshal.Label{
-				{
-					Name:  "__address__",
-					Value: "foo.bar:1234",
-				},
-				{
-					Name:  "__metrics_path__",
-					Value: "/metrics",
-				},
-				{
-					Name:  "__scheme__",
-					Value: "http",
-				},
-				{
-					Name:  "__scrape_interval__",
-					Value: "168h0m0s",
-				},
-				{
-					Name:  "__scrape_timeout__",
-					Value: "24h0m0s",
-				},
-				{
-					Name:  "instance",
-					Value: "foo.bar:1234",
-				},
-				{
-					Name:  "job",
-					Value: "foo",
-				},
-			},
-			AuthConfig:      &promauth.Config{},
-			ProxyAuthConfig: &promauth.Config{},
-			jobNameOriginal: "foo",
 		},
 	})
 }
@@ -1841,70 +1506,4 @@ func equalStaticConfigForScrapeWorks(a, b []*ScrapeWork) bool {
 		}
 	}
 	return true
-}
-
-func TestScrapeConfigClone(t *testing.T) {
-	f := func(sc *ScrapeConfig) {
-		t.Helper()
-		scCopy := sc.clone()
-		if !reflect.DeepEqual(sc, scCopy) {
-			t.Fatalf("unexpected result after unmarshalJSON() for JSON:\n%s", sc.marshalJSON())
-		}
-	}
-
-	f(&ScrapeConfig{})
-
-	bFalse := false
-	var ie promrelabel.IfExpression
-	if err := ie.Parse(`{foo=~"bar",baz!="z"}`); err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	}
-	f(&ScrapeConfig{
-		JobName:         "foo",
-		ScrapeInterval:  promutils.NewDuration(time.Second * 47),
-		HonorLabels:     true,
-		HonorTimestamps: &bFalse,
-		Params: map[string][]string{
-			"foo": {"bar", "baz"},
-		},
-		HTTPClientConfig: promauth.HTTPClientConfig{
-			Authorization: &promauth.Authorization{
-				Credentials: promauth.NewSecret("foo"),
-			},
-			BasicAuth: &promauth.BasicAuthConfig{
-				Username: "user_x",
-				Password: promauth.NewSecret("pass_x"),
-			},
-			BearerToken: promauth.NewSecret("zx"),
-			OAuth2: &promauth.OAuth2Config{
-				ClientSecret: promauth.NewSecret("aa"),
-				Scopes:       []string{"foo", "bar"},
-				TLSConfig: &promauth.TLSConfig{
-					CertFile: "foo",
-				},
-			},
-			TLSConfig: &promauth.TLSConfig{
-				KeyFile: "aaa",
-			},
-		},
-		ProxyURL: proxy.MustNewURL("https://foo.bar:3434/assdf/dsfd?sdf=dsf"),
-		RelabelConfigs: []promrelabel.RelabelConfig{{
-			SourceLabels: []string{"foo", "aaa"},
-			Regex: &promrelabel.MultiLineRegex{
-				S: "foo\nbar",
-			},
-			If: &ie,
-		}},
-		SampleLimit: 10,
-		GCESDConfigs: []gce.SDConfig{{
-			Project: "foo",
-			Zone: gce.ZoneYAML{
-				Zones: []string{"a", "b"},
-			},
-		}},
-		StreamParse: true,
-		ProxyClientConfig: promauth.ProxyClientConfig{
-			BearerTokenFile: "foo",
-		},
-	})
 }

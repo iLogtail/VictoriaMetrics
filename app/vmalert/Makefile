@@ -12,35 +12,20 @@ vmalert-prod:
 vmalert-pure-prod:
 	APP_NAME=vmalert $(MAKE) app-via-docker-pure
 
-vmalert-linux-amd64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-linux-amd64
+vmalert-amd64-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-amd64
 
-vmalert-linux-arm-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-linux-arm
+vmalert-arm-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-arm
 
-vmalert-linux-arm64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-linux-arm64
+vmalert-arm64-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-arm64
 
-vmalert-linux-ppc64le-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-linux-ppc64le
+vmalert-ppc64le-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-ppc64le
 
-vmalert-linux-386-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-linux-386
-
-vmalert-darwin-amd64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-darwin-amd64
-
-vmalert-darwin-arm64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-darwin-arm64
-
-vmalert-freebsd-amd64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-freebsd-amd64
-
-vmalert-openbsd-amd64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-openbsd-amd64
-
-vmalert-windows-amd64-prod:
-	APP_NAME=vmalert $(MAKE) app-via-docker-windows-amd64
+vmalert-386-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-386
 
 package-vmalert:
 	APP_NAME=vmalert $(MAKE) package-via-docker
@@ -68,14 +53,12 @@ publish-vmalert:
 
 test-vmalert:
 	go test -v -race -cover ./app/vmalert -loggerLevel=ERROR
-	go test -v -race -cover ./app/vmalert/templates
 	go test -v -race -cover ./app/vmalert/datasource
 	go test -v -race -cover ./app/vmalert/notifier
 	go test -v -race -cover ./app/vmalert/config
-	go test -v -race -cover ./app/vmalert/remotewrite
 
 run-vmalert: vmalert
-	./bin/vmalert -rule=app/vmalert/config/testdata/rules/rules2-good.rules \
+	./bin/vmalert -rule=app/vmalert/config/testdata/rules2-good.rules \
 		-datasource.url=http://localhost:8428 \
 		-notifier.url=http://localhost:9093 \
 		-notifier.url=http://127.0.0.1:9093 \
@@ -83,54 +66,31 @@ run-vmalert: vmalert
 		-remoteRead.url=http://localhost:8428 \
 		-external.label=cluster=east-1 \
 		-external.label=replica=a \
-		-evaluationInterval=3s \
-		-configCheckInterval=10s
+		-evaluationInterval=3s
 
-run-vmalert-sd: vmalert
-	./bin/vmalert -rule=app/vmalert/config/testdata/rules2-good.rules \
-		-datasource.url=http://localhost:8428 \
-		-remoteWrite.url=http://localhost:8428 \
-		-notifier.config=app/vmalert/notifier/testdata/mixed.good.yaml \
-		-configCheckInterval=10s
+vmalert-amd64:
+	CGO_ENABLED=1 GOARCH=amd64 $(MAKE) vmalert-local-with-goarch
 
-replay-vmalert: vmalert
-	./bin/vmalert -rule=app/vmalert/config/testdata/rules/rules-replay-good.rules \
-		-datasource.url=http://localhost:8428 \
-		-remoteWrite.url=http://localhost:8428 \
-		-external.label=cluster=east-1 \
-		-external.label=replica=a \
-		-replay.timeFrom=2021-05-11T07:21:43Z \
-		-replay.timeTo=2021-05-29T18:40:43Z
+vmalert-arm:
+	CGO_ENABLED=0 GOARCH=arm $(MAKE) vmalert-local-with-goarch
 
-vmalert-linux-amd64:
-	APP_NAME=vmalert CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(MAKE) app-local-goos-goarch
+vmalert-arm64:
+	CGO_ENABLED=0 GOARCH=arm64 $(MAKE) vmalert-local-with-goarch
 
-vmalert-linux-arm:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=linux GOARCH=arm $(MAKE) app-local-goos-goarch
+vmalert-ppc64le:
+	CGO_ENABLED=0 GOARCH=ppc64le $(MAKE) vmalert-local-with-goarch
 
-vmalert-linux-arm64:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(MAKE) app-local-goos-goarch
+vmalert-386:
+	CGO_ENABLED=0 GOARCH=386 $(MAKE) vmalert-local-with-goarch
 
-vmalert-linux-ppc64le:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=linux GOARCH=ppc64le $(MAKE) app-local-goos-goarch
-
-vmalert-linux-386:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=linux GOARCH=386 $(MAKE) app-local-goos-goarch
-
-vmalert-darwin-amd64:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(MAKE) app-local-goos-goarch
-
-vmalert-darwin-arm64:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(MAKE) app-local-goos-goarch
-
-vmalert-freebsd-amd64:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 $(MAKE) app-local-goos-goarch
-
-vmalert-openbsd-amd64:
-	APP_NAME=vmalert CGO_ENABLED=0 GOOS=openbsd GOARCH=amd64 $(MAKE) app-local-goos-goarch
-
-vmalert-windows-amd64:
-	GOARCH=amd64 APP_NAME=vmalert $(MAKE) app-local-windows-goarch
+vmalert-local-with-goarch:
+	APP_NAME=vmalert $(MAKE) app-local-with-goarch
 
 vmalert-pure:
 	APP_NAME=vmalert $(MAKE) app-local-pure
+
+vmalert-windows-amd64:
+	GOARCH=amd64 APP_NAME=vmalert $(MAKE) app-local-windows-with-goarch
+
+vmalert-windows-amd64-prod:
+	APP_NAME=vmalert $(MAKE) app-via-docker-windows-amd64

@@ -14,25 +14,11 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-var (
-	relabelConfig = flag.String("relabelConfig", "", "Optional path to a file with relabeling rules, which are applied to all the ingested metrics. "+
-		"The path can point either to local file or to http url. "+
-		"See https://docs.victoriametrics.com/#relabeling for details. The config is reloaded on SIGHUP signal")
-	relabelDebug = flag.Bool("relabelDebug", false, "Whether to log metrics before and after relabeling with -relabelConfig. If the -relabelDebug is enabled, "+
-		"then the metrics aren't sent to storage. This is useful for debugging the relabeling configs")
-
-	usePromCompatibleNaming = flag.Bool("usePromCompatibleNaming", false, "Whether to replace characters unsupported by Prometheus with underscores "+
-		"in the ingested metric names and label names. For example, foo.bar{a.b='c'} is transformed into foo_bar{a_b='c'} during data ingestion if this flag is set. "+
-		"See https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels")
-)
+var relabelConfig = flag.String("relabelConfig", "", "Optional path to a file with relabeling rules, which are applied to all the ingested metrics. "+
+	"See https://victoriametrics.github.io/#relabeling for details")
 
 // Init must be called after flag.Parse and before using the relabel package.
 func Init() {
-	// Register SIGHUP handler for config re-read just before loadRelabelConfig call.
-	// This guarantees that the config will be re-read if the signal arrives during loadRelabelConfig call.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1240
-	sighupCh := procutil.NewSighupChan()
-
 	pcs, err := loadRelabelConfig()
 	if err != nil {
 		logger.Fatalf("cannot load relabelConfig: %s", err)
@@ -41,6 +27,7 @@ func Init() {
 	if len(*relabelConfig) == 0 {
 		return
 	}
+	sighupCh := procutil.NewSighupChan()
 	go func() {
 		for range sighupCh {
 			logger.Infof("received SIGHUP; reloading -relabelConfig=%q...", *relabelConfig)
@@ -61,7 +48,7 @@ func loadRelabelConfig() (*promrelabel.ParsedConfigs, error) {
 	if len(*relabelConfig) == 0 {
 		return nil, nil
 	}
-	pcs, err := promrelabel.LoadRelabelConfigs(*relabelConfig, *relabelDebug)
+	pcs, err := promrelabel.LoadRelabelConfigs(*relabelConfig)
 	if err != nil {
 		return nil, fmt.Errorf("error when reading -relabelConfig=%q: %w", *relabelConfig, err)
 	}
@@ -71,7 +58,7 @@ func loadRelabelConfig() (*promrelabel.ParsedConfigs, error) {
 // HasRelabeling returns true if there is global relabeling.
 func HasRelabeling() bool {
 	pcs := pcsGlobal.Load().(*promrelabel.ParsedConfigs)
-	return pcs.Len() > 0 || *usePromCompatibleNaming
+	return pcs.Len() > 0
 }
 
 // Ctx holds relabeling context.
@@ -91,11 +78,11 @@ func (ctx *Ctx) Reset() {
 // The returned labels are valid until the next call to ApplyRelabeling.
 func (ctx *Ctx) ApplyRelabeling(labels []prompb.Label) []prompb.Label {
 	pcs := pcsGlobal.Load().(*promrelabel.ParsedConfigs)
-	if pcs.Len() == 0 && !*usePromCompatibleNaming {
+	if pcs.Len() == 0 {
 		// There are no relabeling rules.
 		return labels
 	}
-	// Convert labels to prompbmarshal.Label format suitable for relabeling.
+	// Convert src to prompbmarshal.Label format suitable for relabeling.
 	tmpLabels := ctx.tmpLabels[:0]
 	for _, label := range labels {
 		name := bytesutil.ToUnsafeString(label.Name)
@@ -109,27 +96,12 @@ func (ctx *Ctx) ApplyRelabeling(labels []prompb.Label) []prompb.Label {
 		})
 	}
 
-	if *usePromCompatibleNaming {
-		// Replace unsupported Prometheus chars in label names and metric names with underscores.
-		for i := range tmpLabels {
-			label := &tmpLabels[i]
-			if label.Name == "__name__" {
-				label.Value = promrelabel.SanitizeName(label.Value)
-			} else {
-				label.Name = promrelabel.SanitizeName(label.Name)
-			}
-		}
-	}
-
-	if pcs.Len() > 0 {
-		// Apply relabeling
-		tmpLabels = pcs.Apply(tmpLabels, 0, true)
-		if len(tmpLabels) == 0 {
-			metricsDropped.Inc()
-		}
-	}
-
+	// Apply relabeling
+	tmpLabels = pcs.Apply(tmpLabels, 0, true)
 	ctx.tmpLabels = tmpLabels
+	if len(tmpLabels) == 0 {
+		metricsDropped.Inc()
+	}
 
 	// Return back labels to the desired format.
 	dst := labels[:0]

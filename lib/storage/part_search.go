@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/blockcache"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
@@ -33,6 +32,8 @@ type partSearch struct {
 
 	metaindex []metaindexRow
 
+	ibCache *indexBlockCache
+
 	bhs []blockHeader
 
 	compressedIndexBuf []byte
@@ -47,6 +48,7 @@ func (ps *partSearch) reset() {
 	ps.tsids = nil
 	ps.tsidIdx = 0
 	ps.metaindex = nil
+	ps.ibCache = nil
 	ps.bhs = nil
 	ps.compressedIndexBuf = ps.compressedIndexBuf[:0]
 	ps.indexBuf = ps.indexBuf[:0]
@@ -74,6 +76,7 @@ func (ps *partSearch) Init(p *part, tsids []TSID, tr TimeRange) {
 	}
 	ps.tr = tr
 	ps.metaindex = p.metaindex
+	ps.ibCache = p.ibCache
 
 	// Advance to the first tsid. There is no need in checking
 	// the returned result, since it will be checked in NextBlock.
@@ -151,23 +154,19 @@ func (ps *partSearch) nextBHS() bool {
 
 		// Found the index block which may contain the required data
 		// for the ps.BlockRef.bh.TSID and the given timestamp range.
-		indexBlockKey := blockcache.Key{
-			Part:   ps.p,
-			Offset: mr.IndexBlockOffset,
-		}
-		b := ibCache.GetBlock(indexBlockKey)
-		if b == nil {
+		indexBlockKey := mr.IndexBlockOffset
+		ib := ps.ibCache.Get(indexBlockKey)
+		if ib == nil {
 			// Slow path - actually read and unpack the index block.
-			ib, err := ps.readIndexBlock(mr)
+			var err error
+			ib, err = ps.readIndexBlock(mr)
 			if err != nil {
 				ps.err = fmt.Errorf("cannot read index block for part %q at offset %d with size %d: %w",
 					&ps.p.ph, mr.IndexBlockOffset, mr.IndexBlockSize, err)
 				return false
 			}
-			b = ib
-			ibCache.PutBlock(indexBlockKey, b)
+			ps.ibCache.Put(indexBlockKey, ib)
 		}
-		ib := b.(*indexBlock)
 		ps.bhs = ib.bhs
 		return true
 	}
@@ -211,7 +210,7 @@ func skipSmallMetaindexRows(metaindex []metaindexRow, tsid *TSID) []metaindexRow
 }
 
 func (ps *partSearch) readIndexBlock(mr *metaindexRow) (*indexBlock, error) {
-	ps.compressedIndexBuf = bytesutil.ResizeNoCopyMayOverallocate(ps.compressedIndexBuf, int(mr.IndexBlockSize))
+	ps.compressedIndexBuf = bytesutil.Resize(ps.compressedIndexBuf[:0], int(mr.IndexBlockSize))
 	ps.p.indexFile.MustReadAt(ps.compressedIndexBuf, int64(mr.IndexBlockOffset))
 
 	var err error

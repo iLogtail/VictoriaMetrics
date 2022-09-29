@@ -1,13 +1,11 @@
 package persistentqueue
 
 import (
-	"fmt"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/metrics"
 )
 
 // FastQueue is fast persistent queue, which prefers sending data via memory.
@@ -31,7 +29,7 @@ type FastQueue struct {
 
 	lastInmemoryBlockReadTime uint64
 
-	stopDeadline uint64
+	mustStop bool
 }
 
 // MustOpenFastQueue opens persistent queue at the given path.
@@ -49,12 +47,6 @@ func MustOpenFastQueue(path, name string, maxInmemoryBlocks, maxPendingBytes int
 	}
 	fq.cond.L = &fq.mu
 	fq.lastInmemoryBlockReadTime = fasttime.UnixTimestamp()
-	_ = metrics.GetOrCreateGauge(fmt.Sprintf(`vm_persistentqueue_bytes_pending{path=%q}`, path), func() float64 {
-		fq.mu.Lock()
-		n := fq.pq.GetPendingBytes()
-		fq.mu.Unlock()
-		return float64(n)
-	})
 	pendingBytes := fq.GetPendingBytes()
 	logger.Infof("opened fast persistent queue at %q with maxInmemoryBlocks=%d, it contains %d pending bytes", path, maxInmemoryBlocks, pendingBytes)
 	return fq
@@ -66,9 +58,7 @@ func (fq *FastQueue) UnblockAllReaders() {
 	defer fq.mu.Unlock()
 
 	// Unblock blocked readers
-	// Allow for up to 5 seconds for sending Prometheus stale markers.
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1526
-	fq.stopDeadline = fasttime.UnixTimestamp() + 5
+	fq.mustStop = true
 	fq.cond.Broadcast()
 }
 
@@ -169,7 +159,7 @@ func (fq *FastQueue) MustReadBlock(dst []byte) ([]byte, bool) {
 	defer fq.mu.Unlock()
 
 	for {
-		if fq.stopDeadline > 0 && fasttime.UnixTimestamp() > fq.stopDeadline {
+		if fq.mustStop {
 			return dst, false
 		}
 		if len(fq.ch) > 0 {
@@ -191,9 +181,7 @@ func (fq *FastQueue) MustReadBlock(dst []byte) ([]byte, bool) {
 			dst = data
 			continue
 		}
-		if fq.stopDeadline > 0 {
-			return dst, false
-		}
+
 		// There are no blocks. Wait for new block.
 		fq.pq.ResetIfEmpty()
 		fq.cond.Wait()

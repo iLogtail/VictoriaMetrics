@@ -16,8 +16,8 @@ import (
 )
 
 var (
-	maxLineSize   = flagutil.NewBytes("influx.maxLineSize", 256*1024, "The maximum size in bytes for a single InfluxDB line during parsing")
-	trimTimestamp = flag.Duration("influxTrimTimestamp", time.Millisecond, "Trim timestamps for InfluxDB line protocol data to this duration. "+
+	maxLineSize   = flagutil.NewBytes("influx.maxLineSize", 256*1024, "The maximum size in bytes for a single Influx line during parsing")
+	trimTimestamp = flag.Duration("influxTrimTimestamp", time.Millisecond, "Trim timestamps for Influx line protocol data to this duration. "+
 		"Minimum practical duration is 1ms. Higher duration (i.e. 1s) may be used for reducing disk space usage for timestamp data")
 )
 
@@ -36,7 +36,8 @@ func ParseStream(r io.Reader, isGzipped bool, precision, db string, callback fun
 		r = zr
 	}
 
-	tsMultiplier := int64(0)
+	// Default precision is 'ns'. See https://docs.influxdata.com/influxdb/v1.7/write_protocols/line_protocol_tutorial/#timestamp
+	tsMultiplier := int64(1e6)
 	switch precision {
 	case "ns":
 		tsMultiplier = 1e6
@@ -56,8 +57,16 @@ func ParseStream(r io.Reader, isGzipped bool, precision, db string, callback fun
 	defer putStreamContext(ctx)
 	for ctx.Read() {
 		uw := getUnmarshalWork()
-		uw.ctx = ctx
-		uw.callback = callback
+		uw.callback = func(db string, rows []Row) {
+			if err := callback(db, rows); err != nil {
+				ctx.callbackErrLock.Lock()
+				if ctx.callbackErr == nil {
+					ctx.callbackErr = fmt.Errorf("error when processing imported data: %w", err)
+				}
+				ctx.callbackErrLock.Unlock()
+			}
+			ctx.wg.Done()
+		}
 		uw.db = db
 		uw.tsMultiplier = tsMultiplier
 		uw.reqBuf, ctx.reqBuf = ctx.reqBuf, uw.reqBuf
@@ -73,7 +82,7 @@ func ParseStream(r io.Reader, isGzipped bool, precision, db string, callback fun
 
 func (ctx *streamContext) Read() bool {
 	readCalls.Inc()
-	if ctx.err != nil || ctx.hasCallbackError() {
+	if ctx.err != nil {
 		return false
 	}
 	ctx.reqBuf, ctx.tailBuf, ctx.err = common.ReadLinesBlockExt(ctx.br, ctx.reqBuf, ctx.tailBuf, maxLineSize.N)
@@ -109,13 +118,6 @@ func (ctx *streamContext) Error() error {
 		return nil
 	}
 	return ctx.err
-}
-
-func (ctx *streamContext) hasCallbackError() bool {
-	ctx.callbackErrLock.Lock()
-	ok := ctx.callbackErr != nil
-	ctx.callbackErrLock.Unlock()
-	return ok
 }
 
 func (ctx *streamContext) reset() {
@@ -157,8 +159,7 @@ var streamContextPoolCh = make(chan *streamContext, cgroup.AvailableCPUs())
 
 type unmarshalWork struct {
 	rows         Rows
-	ctx          *streamContext
-	callback     func(db string, rows []Row) error
+	callback     func(db string, rows []Row)
 	db           string
 	tsMultiplier int64
 	reqBuf       []byte
@@ -166,23 +167,10 @@ type unmarshalWork struct {
 
 func (uw *unmarshalWork) reset() {
 	uw.rows.Reset()
-	uw.ctx = nil
 	uw.callback = nil
 	uw.db = ""
 	uw.tsMultiplier = 0
 	uw.reqBuf = uw.reqBuf[:0]
-}
-
-func (uw *unmarshalWork) runCallback(rows []Row) {
-	ctx := uw.ctx
-	if err := uw.callback(uw.db, rows); err != nil {
-		ctx.callbackErrLock.Lock()
-		if ctx.callbackErr == nil {
-			ctx.callbackErr = fmt.Errorf("error when processing imported data: %w", err)
-		}
-		ctx.callbackErrLock.Unlock()
-	}
-	ctx.wg.Done()
 }
 
 // Unmarshal implements common.UnmarshalWork
@@ -194,14 +182,7 @@ func (uw *unmarshalWork) Unmarshal() {
 	// Adjust timestamps according to uw.tsMultiplier
 	currentTs := time.Now().UnixNano() / 1e6
 	tsMultiplier := uw.tsMultiplier
-	if tsMultiplier == 0 {
-		// Default precision is 'ns'. See https://docs.influxdata.com/influxdb/v1.7/write_protocols/line_protocol_tutorial/#timestamp
-		// But it can be in ns, us, ms or s depending on the number of digits in practice.
-		for i := range rows {
-			tsPtr := &rows[i].Timestamp
-			*tsPtr = detectTimestamp(*tsPtr, currentTs)
-		}
-	} else if tsMultiplier >= 1 {
+	if tsMultiplier >= 1 {
 		for i := range rows {
 			row := &rows[i]
 			if row.Timestamp == 0 {
@@ -231,7 +212,7 @@ func (uw *unmarshalWork) Unmarshal() {
 		}
 	}
 
-	uw.runCallback(rows)
+	uw.callback(uw.db, rows)
 	putUnmarshalWork(uw)
 }
 
@@ -249,23 +230,3 @@ func putUnmarshalWork(uw *unmarshalWork) {
 }
 
 var unmarshalWorkPool sync.Pool
-
-func detectTimestamp(ts, currentTs int64) int64 {
-	if ts == 0 {
-		return currentTs
-	}
-	if ts >= 1e17 {
-		// convert nanoseconds to milliseconds
-		return ts / 1e6
-	}
-	if ts >= 1e14 {
-		// convert microseconds to milliseconds
-		return ts / 1e3
-	}
-	if ts >= 1e11 {
-		// the ts is in milliseconds
-		return ts
-	}
-	// convert seconds to milliseconds
-	return ts * 1e3
-}

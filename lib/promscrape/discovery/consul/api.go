@@ -3,6 +3,7 @@ package consul
 import (
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"strconv"
 	"strings"
@@ -37,27 +38,19 @@ func getAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 }
 
 func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
-	hcc := sdc.HTTPClientConfig
 	token, err := getToken(sdc.Token)
 	if err != nil {
 		return nil, err
 	}
-	if token != "" {
-		if hcc.BearerToken != nil {
-			return nil, fmt.Errorf("cannot set both token and bearer_token configs")
-		}
-		hcc.BearerToken = promauth.NewSecret(token)
-	}
+	var ba *promauth.BasicAuthConfig
 	if len(sdc.Username) > 0 {
-		if hcc.BasicAuth != nil {
-			return nil, fmt.Errorf("cannot set both username and basic_auth configs")
-		}
-		hcc.BasicAuth = &promauth.BasicAuthConfig{
+		ba = &promauth.BasicAuthConfig{
 			Username: sdc.Username,
 			Password: sdc.Password,
 		}
+		token = ""
 	}
-	ac, err := hcc.NewConfig(baseDir)
+	ac, err := promauth.NewConfig(baseDir, nil, ba, token, "", sdc.TLSConfig)
 	if err != nil {
 		return nil, fmt.Errorf("cannot parse auth config: %w", err)
 	}
@@ -89,13 +82,7 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 		return nil, err
 	}
 
-	namespace := sdc.Namespace
-	// default namespace can be detected from env var.
-	if namespace == "" {
-		namespace = os.Getenv("CONSUL_NAMESPACE")
-	}
-
-	cw := newConsulWatcher(client, sdc, dc, namespace)
+	cw := newConsulWatcher(client, sdc, dc)
 	cfg := &apiConfig{
 		tagSeparator:  tagSeparator,
 		consulWatcher: cw,
@@ -103,12 +90,12 @@ func newAPIConfig(sdc *SDConfig, baseDir string) (*apiConfig, error) {
 	return cfg, nil
 }
 
-func getToken(token *promauth.Secret) (string, error) {
+func getToken(token *string) (string, error) {
 	if token != nil {
-		return token.String(), nil
+		return *token, nil
 	}
 	if tokenFile := os.Getenv("CONSUL_HTTP_TOKEN_FILE"); tokenFile != "" {
-		data, err := os.ReadFile(tokenFile)
+		data, err := ioutil.ReadFile(tokenFile)
 		if err != nil {
 			return "", fmt.Errorf("cannot read consul token file %q; probably, `token` arg is missing in `consul_sd_config`? error: %w", tokenFile, err)
 		}

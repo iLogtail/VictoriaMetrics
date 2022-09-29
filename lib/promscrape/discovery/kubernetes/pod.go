@@ -66,7 +66,6 @@ type PodSpec struct {
 // See https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.17/#container-v1-core
 type Container struct {
 	Name  string
-	Image string
 	Ports []ContainerPort
 }
 
@@ -104,24 +103,26 @@ func (p *Pod) getTargetLabels(gw *groupWatcher) []map[string]string {
 		return nil
 	}
 	var ms []map[string]string
-	ms = appendPodLabels(ms, gw, p, p.Spec.Containers, "false")
-	ms = appendPodLabels(ms, gw, p, p.Spec.InitContainers, "true")
+	ms = appendPodLabels(ms, p, p.Spec.Containers, "false")
+	ms = appendPodLabels(ms, p, p.Spec.InitContainers, "true")
 	return ms
 }
 
-func appendPodLabels(ms []map[string]string, gw *groupWatcher, p *Pod, cs []Container, isInit string) []map[string]string {
+func appendPodLabels(ms []map[string]string, p *Pod, cs []Container, isInit string) []map[string]string {
 	for _, c := range cs {
 		for _, cp := range c.Ports {
-			ms = appendPodLabelsInternal(ms, gw, p, c, &cp, isInit)
+			m := getPodLabels(p, c, &cp, isInit)
+			ms = append(ms, m)
 		}
 		if len(c.Ports) == 0 {
-			ms = appendPodLabelsInternal(ms, gw, p, c, nil, isInit)
+			m := getPodLabels(p, c, nil, isInit)
+			ms = append(ms, m)
 		}
 	}
 	return ms
 }
 
-func appendPodLabelsInternal(ms []map[string]string, gw *groupWatcher, p *Pod, c Container, cp *ContainerPort, isInit string) []map[string]string {
+func getPodLabels(p *Pod, c Container, cp *ContainerPort, isInit string) map[string]string {
 	addr := p.Status.PodIP
 	if cp != nil {
 		addr = discoveryutils.JoinHostPort(addr, cp.ContainerPort)
@@ -130,13 +131,12 @@ func appendPodLabelsInternal(ms []map[string]string, gw *groupWatcher, p *Pod, c
 		"__address__":                          addr,
 		"__meta_kubernetes_pod_container_init": isInit,
 	}
-	p.appendCommonLabels(m, gw)
+	p.appendCommonLabels(m)
 	p.appendContainerLabels(m, c, cp)
-	return append(ms, m)
+	return m
 }
 
 func (p *Pod) appendContainerLabels(m map[string]string, c Container, cp *ContainerPort) {
-	m["__meta_kubernetes_pod_container_image"] = c.Image
 	m["__meta_kubernetes_pod_container_name"] = c.Name
 	if cp != nil {
 		m["__meta_kubernetes_pod_container_port_name"] = cp.Name
@@ -145,15 +145,7 @@ func (p *Pod) appendContainerLabels(m map[string]string, c Container, cp *Contai
 	}
 }
 
-func (p *Pod) appendCommonLabels(m map[string]string, gw *groupWatcher) {
-	if gw.attachNodeMetadata {
-		m["__meta_kubernetes_node_name"] = p.Spec.NodeName
-		o := gw.getObjectByRoleLocked("node", p.Metadata.Namespace, p.Spec.NodeName)
-		if o != nil {
-			n := o.(*Node)
-			n.Metadata.registerLabelsAndAnnotations("__meta_kubernetes_node", m)
-		}
-	}
+func (p *Pod) appendCommonLabels(m map[string]string) {
 	m["__meta_kubernetes_pod_name"] = p.Metadata.Name
 	m["__meta_kubernetes_pod_ip"] = p.Status.PodIP
 	m["__meta_kubernetes_pod_ready"] = getPodReadyStatus(p.Status.Conditions)

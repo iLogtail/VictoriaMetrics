@@ -23,7 +23,6 @@ type table struct {
 
 	getDeletedMetricIDs func() *uint64set.Set
 	retentionMsecs      int64
-	isReadOnly          *uint32
 
 	ptws     []*partitionWrapper
 	ptwsLock sync.Mutex
@@ -32,8 +31,7 @@ type table struct {
 
 	stop chan struct{}
 
-	retentionWatcherWG  sync.WaitGroup
-	finalDedupWatcherWG sync.WaitGroup
+	retentionWatcherWG sync.WaitGroup
 }
 
 // partitionWrapper provides refcounting mechanism for the partition.
@@ -84,7 +82,7 @@ func (ptw *partitionWrapper) scheduleToDrop() {
 // The table is created if it doesn't exist.
 //
 // Data older than the retentionMsecs may be dropped at any time.
-func openTable(path string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) (*table, error) {
+func openTable(path string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) (*table, error) {
 	path = filepath.Clean(path)
 
 	// Create a directory for the table if it doesn't exist yet.
@@ -103,26 +101,21 @@ func openTable(path string, getDeletedMetricIDs func() *uint64set.Set, retention
 	if err := fs.MkdirAllIfNotExist(smallPartitionsPath); err != nil {
 		return nil, fmt.Errorf("cannot create directory for small partitions %q: %w", smallPartitionsPath, err)
 	}
-	fs.MustRemoveTemporaryDirs(smallPartitionsPath)
 	smallSnapshotsPath := smallPartitionsPath + "/snapshots"
 	if err := fs.MkdirAllIfNotExist(smallSnapshotsPath); err != nil {
 		return nil, fmt.Errorf("cannot create %q: %w", smallSnapshotsPath, err)
 	}
-	fs.MustRemoveTemporaryDirs(smallSnapshotsPath)
-
 	bigPartitionsPath := path + "/big"
 	if err := fs.MkdirAllIfNotExist(bigPartitionsPath); err != nil {
 		return nil, fmt.Errorf("cannot create directory for big partitions %q: %w", bigPartitionsPath, err)
 	}
-	fs.MustRemoveTemporaryDirs(bigPartitionsPath)
 	bigSnapshotsPath := bigPartitionsPath + "/snapshots"
 	if err := fs.MkdirAllIfNotExist(bigSnapshotsPath); err != nil {
 		return nil, fmt.Errorf("cannot create %q: %w", bigSnapshotsPath, err)
 	}
-	fs.MustRemoveTemporaryDirs(bigSnapshotsPath)
 
 	// Open partitions.
-	pts, err := openPartitions(smallPartitionsPath, bigPartitionsPath, getDeletedMetricIDs, retentionMsecs, isReadOnly)
+	pts, err := openPartitions(smallPartitionsPath, bigPartitionsPath, getDeletedMetricIDs, retentionMsecs)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open partitions in the table %q: %w", path, err)
 	}
@@ -133,7 +126,6 @@ func openTable(path string, getDeletedMetricIDs func() *uint64set.Set, retention
 		bigPartitionsPath:   bigPartitionsPath,
 		getDeletedMetricIDs: getDeletedMetricIDs,
 		retentionMsecs:      retentionMsecs,
-		isReadOnly:          isReadOnly,
 
 		flockF: flockF,
 
@@ -143,7 +135,6 @@ func openTable(path string, getDeletedMetricIDs func() *uint64set.Set, retention
 		tb.addPartitionNolock(pt)
 	}
 	tb.startRetentionWatcher()
-	tb.startFinalDedupWatcher()
 	return tb, nil
 }
 
@@ -184,9 +175,9 @@ func (tb *table) CreateSnapshot(snapshotName string) (string, string, error) {
 // MustDeleteSnapshot deletes snapshot with the given snapshotName.
 func (tb *table) MustDeleteSnapshot(snapshotName string) {
 	smallDir := fmt.Sprintf("%s/small/snapshots/%s", tb.path, snapshotName)
-	fs.MustRemoveDirAtomic(smallDir)
+	fs.MustRemoveAll(smallDir)
 	bigDir := fmt.Sprintf("%s/big/snapshots/%s", tb.path, snapshotName)
-	fs.MustRemoveDirAtomic(bigDir)
+	fs.MustRemoveAll(bigDir)
 }
 
 func (tb *table) addPartitionNolock(pt *partition) {
@@ -202,7 +193,6 @@ func (tb *table) addPartitionNolock(pt *partition) {
 func (tb *table) MustClose() {
 	close(tb.stop)
 	tb.retentionWatcherWG.Wait()
-	tb.finalDedupWatcherWG.Wait()
 
 	tb.ptwsLock.Lock()
 	ptws := tb.ptws
@@ -345,6 +335,7 @@ func (tb *table) AddRows(rows []rawRow) error {
 	// Do this under tb.ptwsLock.
 	minTimestamp, maxTimestamp := tb.getMinMaxTimestamps()
 	tb.ptwsLock.Lock()
+	var errors []error
 	for i := range missingRows {
 		r := &missingRows[i]
 
@@ -366,17 +357,20 @@ func (tb *table) AddRows(rows []rawRow) error {
 			continue
 		}
 
-		pt, err := createPartition(r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.getDeletedMetricIDs, tb.retentionMsecs, tb.isReadOnly)
+		pt, err := createPartition(r.Timestamp, tb.smallPartitionsPath, tb.bigPartitionsPath, tb.getDeletedMetricIDs, tb.retentionMsecs)
 		if err != nil {
-			// Return only the first error, since it has no sense in returning all errors.
-			tb.ptwsLock.Unlock()
-			return fmt.Errorf("errors while adding rows to table %q: %w", tb.path, err)
+			errors = append(errors, err)
+			continue
 		}
 		pt.AddRows(missingRows[i : i+1])
 		tb.addPartitionNolock(pt)
 	}
 	tb.ptwsLock.Unlock()
 
+	if len(errors) > 0 {
+		// Return only the first error, since it has no sense in returning all errors.
+		return fmt.Errorf("errors while adding rows to table %q: %w", tb.path, errors[0])
+	}
 	return nil
 }
 
@@ -441,47 +435,6 @@ func (tb *table) retentionWatcher() {
 	}
 }
 
-func (tb *table) startFinalDedupWatcher() {
-	tb.finalDedupWatcherWG.Add(1)
-	go func() {
-		tb.finalDedupWatcher()
-		tb.finalDedupWatcherWG.Done()
-	}()
-}
-
-func (tb *table) finalDedupWatcher() {
-	if !isDedupEnabled() {
-		// Deduplication is disabled.
-		return
-	}
-	f := func() {
-		ptws := tb.GetPartitions(nil)
-		defer tb.PutPartitions(ptws)
-		timestamp := timestampFromTime(time.Now())
-		currentPartitionName := timestampToPartitionName(timestamp)
-		for _, ptw := range ptws {
-			if ptw.pt.name == currentPartitionName {
-				// Do not run final dedup for the current month.
-				continue
-			}
-			if err := ptw.pt.runFinalDedup(); err != nil {
-				logger.Errorf("cannot run final dedup for partition %s: %s", ptw.pt.name, err)
-				continue
-			}
-		}
-	}
-	t := time.NewTicker(time.Hour)
-	defer t.Stop()
-	for {
-		select {
-		case <-tb.stop:
-			return
-		case <-t.C:
-			f()
-		}
-	}
-}
-
 // GetPartitions appends tb's partitions snapshot to dst and returns the result.
 //
 // The returned partitions must be passed to PutPartitions
@@ -504,7 +457,7 @@ func (tb *table) PutPartitions(ptws []*partitionWrapper) {
 	}
 }
 
-func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64, isReadOnly *uint32) ([]*partition, error) {
+func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMetricIDs func() *uint64set.Set, retentionMsecs int64) ([]*partition, error) {
 	// Certain partition directories in either `big` or `small` dir may be missing
 	// after restoring from backup. So populate partition names from both dirs.
 	ptNames := make(map[string]bool)
@@ -518,7 +471,7 @@ func openPartitions(smallPartitionsPath, bigPartitionsPath string, getDeletedMet
 	for ptName := range ptNames {
 		smallPartsPath := smallPartitionsPath + "/" + ptName
 		bigPartsPath := bigPartitionsPath + "/" + ptName
-		pt, err := openPartition(smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs, isReadOnly)
+		pt, err := openPartition(smallPartsPath, bigPartsPath, getDeletedMetricIDs, retentionMsecs)
 		if err != nil {
 			mustClosePartitions(pts)
 			return nil, fmt.Errorf("cannot open partition %q: %w", ptName, err)

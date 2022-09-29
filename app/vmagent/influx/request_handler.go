@@ -8,38 +8,34 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmagent/remotewrite"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	parserCommon "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/influx"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/tenantmetrics"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/writeconcurrencylimiter"
 	"github.com/VictoriaMetrics/metrics"
 )
 
 var (
-	measurementFieldSeparator = flag.String("influxMeasurementFieldSeparator", "_", "Separator for '{measurement}{separator}{field_name}' metric name when inserted via InfluxDB line protocol")
-	skipSingleField           = flag.Bool("influxSkipSingleField", false, "Uses '{measurement}' instead of '{measurement}{separator}{field_name}' for metic name if InfluxDB line contains only a single field")
+	measurementFieldSeparator = flag.String("influxMeasurementFieldSeparator", "_", "Separator for '{measurement}{separator}{field_name}' metric name when inserted via Influx line protocol")
+	skipSingleField           = flag.Bool("influxSkipSingleField", false, "Uses '{measurement}' instead of '{measurement}{separator}{field_name}' for metic name if Influx line contains only a single field")
 	skipMeasurement           = flag.Bool("influxSkipMeasurement", false, "Uses '{field_name}' as a metric name while ignoring '{measurement}' and '-influxMeasurementFieldSeparator'")
-	dbLabel                   = flag.String("influxDBLabel", "db", "Default label for the DB name sent over '?db={db_name}' query parameter")
 )
 
 var (
-	rowsInserted       = metrics.NewCounter(`vmagent_rows_inserted_total{type="influx"}`)
-	rowsTenantInserted = tenantmetrics.NewCounterMap(`vmagent_tenant_inserted_rows_total{type="influx"}`)
-	rowsPerInsert      = metrics.NewHistogram(`vmagent_rows_per_insert{type="influx"}`)
+	rowsInserted  = metrics.NewCounter(`vmagent_rows_inserted_total{type="influx"}`)
+	rowsPerInsert = metrics.NewHistogram(`vmagent_rows_per_insert{type="influx"}`)
 )
 
 // InsertHandlerForReader processes remote write for influx line protocol.
 //
 // See https://github.com/influxdata/telegraf/tree/master/plugins/inputs/socket_listener/
-func InsertHandlerForReader(r io.Reader, isGzipped bool) error {
+func InsertHandlerForReader(r io.Reader) error {
 	return writeconcurrencylimiter.Do(func() error {
-		return parser.ParseStream(r, isGzipped, "", "", func(db string, rows []parser.Row) error {
-			return insertRows(nil, db, rows, nil)
+		return parser.ParseStream(r, false, "", "", func(db string, rows []parser.Row) error {
+			return insertRows(db, rows, nil)
 		})
 	})
 }
@@ -47,7 +43,7 @@ func InsertHandlerForReader(r io.Reader, isGzipped bool) error {
 // InsertHandlerForHTTP processes remote write for influx line protocol.
 //
 // See https://github.com/influxdata/influxdb/blob/4cbdc197b8117fee648d62e2e5be75c6575352f0/tsdb/README.md
-func InsertHandlerForHTTP(at *auth.Token, req *http.Request) error {
+func InsertHandlerForHTTP(req *http.Request) error {
 	extraLabels, err := parserCommon.GetExtraLabels(req)
 	if err != nil {
 		return err
@@ -59,12 +55,12 @@ func InsertHandlerForHTTP(at *auth.Token, req *http.Request) error {
 		// Read db tag from https://docs.influxdata.com/influxdb/v1.7/tools/api/#write-http-endpoint
 		db := q.Get("db")
 		return parser.ParseStream(req.Body, isGzipped, precision, db, func(db string, rows []parser.Row) error {
-			return insertRows(at, db, rows, extraLabels)
+			return insertRows(db, rows, extraLabels)
 		})
 	})
 }
 
-func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prompbmarshal.Label) error {
+func insertRows(db string, rows []parser.Row, extraLabels []prompbmarshal.Label) error {
 	ctx := getPushCtx()
 	defer putPushCtx(ctx)
 
@@ -81,7 +77,7 @@ func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prom
 		hasDBKey := false
 		for j := range r.Tags {
 			tag := &r.Tags[j]
-			if tag.Key == *dbLabel {
+			if tag.Key == "db" {
 				hasDBKey = true
 			}
 			commonLabels = append(commonLabels, prompbmarshal.Label{
@@ -91,7 +87,7 @@ func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prom
 		}
 		if len(db) > 0 && !hasDBKey {
 			commonLabels = append(commonLabels, prompbmarshal.Label{
-				Name:  *dbLabel,
+				Name:  "db",
 				Value: db,
 			})
 		}
@@ -134,11 +130,8 @@ func insertRows(at *auth.Token, db string, rows []parser.Row, extraLabels []prom
 	ctx.ctx.Labels = labels
 	ctx.ctx.Samples = samples
 	ctx.commonLabels = commonLabels
-	remotewrite.Push(at, &ctx.ctx.WriteRequest)
+	remotewrite.Push(&ctx.ctx.WriteRequest)
 	rowsInserted.Add(rowsTotal)
-	if at != nil {
-		rowsTenantInserted.Get(at).Add(rowsTotal)
-	}
 	rowsPerInsert.Update(float64(rowsTotal))
 
 	return nil

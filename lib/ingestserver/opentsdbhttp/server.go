@@ -30,7 +30,7 @@ type Server struct {
 // MustStop must be called on the returned server when it is no longer needed.
 func MustStart(addr string, insertHandler func(r *http.Request) error) *Server {
 	logger.Infof("starting HTTP OpenTSDB server at %q", addr)
-	lnTCP, err := netutil.NewTCPListener("opentsdbhttp", addr, nil)
+	lnTCP, err := netutil.NewTCPListener("opentsdbhttp", addr)
 	if err != nil {
 		logger.Fatalf("cannot start HTTP OpenTSDB collector at %q: %s", addr, err)
 	}
@@ -89,7 +89,7 @@ func newRequestHandler(insertHandler func(r *http.Request) error) http.Handler {
 		writeRequests.Inc()
 		if err := insertHandler(r); err != nil {
 			writeErrors.Inc()
-			httpserver.Errorf(w, r, "%s", err)
+			httpserver.Errorf(w, r, "error in %q: %s", r.URL.Path, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)

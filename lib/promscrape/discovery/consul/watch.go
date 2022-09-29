@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +16,7 @@ import (
 // SDCheckInterval is check interval for Consul service discovery.
 var SDCheckInterval = flag.Duration("promscrape.consulSDCheckInterval", 30*time.Second, "Interval for checking for changes in Consul. "+
 	"This works only if consul_sd_configs is configured in '-promscrape.config' file. "+
-	"See https://docs.victoriametrics.com/sd_configs.html#consul_sd_configs for details")
+	"See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#consul_sd_config for details")
 
 // consulWatcher is a watcher for consul api, updates services map in background with long-polling.
 type consulWatcher struct {
@@ -42,14 +41,11 @@ type serviceWatcher struct {
 	stopCh       chan struct{}
 }
 
-// newConsulWatcher creates new watcher and starts background service discovery for Consul.
-func newConsulWatcher(client *discoveryutils.Client, sdc *SDConfig, datacenter, namespace string) *consulWatcher {
+// newConsulWatcher creates new watcher and start background service discovery for Consul.
+func newConsulWatcher(client *discoveryutils.Client, sdc *SDConfig, datacenter string) *consulWatcher {
 	baseQueryArgs := "?dc=" + url.QueryEscape(datacenter)
-	if sdc.AllowStale == nil || *sdc.AllowStale {
+	if sdc.AllowStale {
 		baseQueryArgs += "&stale"
-	}
-	if namespace != "" {
-		baseQueryArgs += "&ns=" + namespace
 	}
 	for k, v := range sdc.NodeMeta {
 		baseQueryArgs += "&node-meta=" + url.QueryEscape(k+":"+v)
@@ -67,10 +63,7 @@ func newConsulWatcher(client *discoveryutils.Client, sdc *SDConfig, datacenter, 
 		services:              make(map[string]*serviceWatcher),
 		stopCh:                make(chan struct{}),
 	}
-	initCh := make(chan struct{})
-	go cw.watchForServicesUpdates(initCh)
-	// wait for initialization to complete
-	<-initCh
+	go cw.watchForServicesUpdates()
 	return cw
 }
 
@@ -81,57 +74,11 @@ func (cw *consulWatcher) mustStop() {
 	// TODO: add ability to cancel blocking requests.
 }
 
-func (cw *consulWatcher) updateServices(serviceNames []string) {
-	var initWG sync.WaitGroup
-	// Start watchers for new services.
-	cw.servicesLock.Lock()
-	for _, serviceName := range serviceNames {
-		if _, ok := cw.services[serviceName]; ok {
-			// The watcher for serviceName already exists.
-			continue
-		}
-		sw := &serviceWatcher{
-			serviceName: serviceName,
-			stopCh:      make(chan struct{}),
-		}
-		cw.services[serviceName] = sw
-		cw.wg.Add(1)
-		serviceWatchersCreated.Inc()
-		initWG.Add(1)
-		go func() {
-			serviceWatchersCount.Inc()
-			sw.watchForServiceNodesUpdates(cw, &initWG)
-			serviceWatchersCount.Dec()
-			cw.wg.Done()
-		}()
-	}
-
-	// Stop watchers for removed services.
-	newServiceNamesMap := make(map[string]struct{}, len(serviceNames))
-	for _, serviceName := range serviceNames {
-		newServiceNamesMap[serviceName] = struct{}{}
-	}
-	for serviceName, sw := range cw.services {
-		if _, ok := newServiceNamesMap[serviceName]; ok {
-			continue
-		}
-		close(sw.stopCh)
-		delete(cw.services, serviceName)
-		serviceWatchersStopped.Inc()
-
-		// Do not wait for the watcher goroutine to exit, since this may take for up to maxWaitTime
-		// if it is blocked in Consul API request.
-	}
-	cw.servicesLock.Unlock()
-
-	// Wait for initialization to complete.
-	initWG.Wait()
-}
-
 // watchForServicesUpdates watches for new services and updates it in cw.
-//
-// watchForServicesUpdates closes the initCh once the initialization is complete and first discovery iteration is done.
-func (cw *consulWatcher) watchForServicesUpdates(initCh chan struct{}) {
+func (cw *consulWatcher) watchForServicesUpdates() {
+	checkInterval := getCheckInterval()
+	ticker := time.NewTicker(checkInterval / 2)
+	defer ticker.Stop()
 	index := int64(0)
 	clientAddr := cw.client.Addr()
 	f := func() {
@@ -144,19 +91,51 @@ func (cw *consulWatcher) watchForServicesUpdates(initCh chan struct{}) {
 			// Nothing changed.
 			return
 		}
-		cw.updateServices(serviceNames)
+
+		cw.servicesLock.Lock()
+		// Start watchers for new services.
+		for _, serviceName := range serviceNames {
+			if _, ok := cw.services[serviceName]; ok {
+				// The watcher for serviceName already exists.
+				continue
+			}
+			sw := &serviceWatcher{
+				serviceName: serviceName,
+				stopCh:      make(chan struct{}),
+			}
+			cw.services[serviceName] = sw
+			cw.wg.Add(1)
+			serviceWatchersCreated.Inc()
+			go func() {
+				serviceWatchersCount.Inc()
+				sw.watchForServiceNodesUpdates(cw)
+				serviceWatchersCount.Dec()
+				cw.wg.Done()
+			}()
+		}
+		// Stop watchers for removed services.
+		newServiceNamesMap := make(map[string]struct{}, len(serviceNames))
+		for _, serviceName := range serviceNames {
+			newServiceNamesMap[serviceName] = struct{}{}
+		}
+		for serviceName, sw := range cw.services {
+			if _, ok := newServiceNamesMap[serviceName]; ok {
+				continue
+			}
+			close(sw.stopCh)
+			delete(cw.services, serviceName)
+			serviceWatchersStopped.Inc()
+
+			// Do not wait for the watcher goroutine to exit, since this may take for up to maxWaitTime
+			// if it is blocked in Consul API request.
+		}
+		cw.servicesLock.Unlock()
+
 		index = newIndex
 	}
 
 	logger.Infof("started Consul service watcher for %q", clientAddr)
 	f()
-
-	// send signal that initialization is complete
-	close(initCh)
-
-	checkInterval := getCheckInterval()
-	ticker := time.NewTicker(checkInterval / 2)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
@@ -213,9 +192,10 @@ func (cw *consulWatcher) getBlockingServiceNames(index int64) ([]string, int64, 
 }
 
 // watchForServiceNodesUpdates watches for Consul serviceNode changes for the given serviceName.
-//
-// watchForServiceNodesUpdates calls initWG.Done() once the initialization is complete and the first discovery iteration is done.
-func (sw *serviceWatcher) watchForServiceNodesUpdates(cw *consulWatcher, initWG *sync.WaitGroup) {
+func (sw *serviceWatcher) watchForServiceNodesUpdates(cw *consulWatcher) {
+	checkInterval := getCheckInterval()
+	ticker := time.NewTicker(checkInterval / 2)
+	defer ticker.Stop()
 	clientAddr := cw.client.Addr()
 	index := int64(0)
 	path := "/v1/health/service/" + sw.serviceName + cw.serviceNodesQueryArgs
@@ -243,12 +223,6 @@ func (sw *serviceWatcher) watchForServiceNodesUpdates(cw *consulWatcher, initWG 
 	}
 
 	f()
-	// Notify caller that initialization is complete
-	initWG.Done()
-
-	checkInterval := getCheckInterval()
-	ticker := time.NewTicker(checkInterval / 2)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
@@ -275,8 +249,7 @@ func shouldCollectServiceByName(filterServices []string, serviceName string) boo
 		return true
 	}
 	for _, filterService := range filterServices {
-		// Use case-insensitive comparison for service names according to https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1422
-		if strings.EqualFold(filterService, serviceName) {
+		if filterService == serviceName {
 			return true
 		}
 	}

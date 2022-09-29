@@ -1,11 +1,10 @@
 package graphite
 
 import (
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"reflect"
 	"strings"
 	"testing"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 )
 
 func TestUnmarshalMetricAndTagsFailure(t *testing.T) {
@@ -19,6 +18,13 @@ func TestUnmarshalMetricAndTagsFailure(t *testing.T) {
 	}
 	f("")
 	f(";foo=bar")
+	f(" ")
+	f("foo ;bar=baz")
+	f("f oo;bar=baz")
+	f("foo;bar=baz   ")
+	f("foo;bar= baz")
+	f("foo;bar=b az")
+	f("foo;b ar=baz")
 }
 
 func TestUnmarshalMetricAndTagsSuccess(t *testing.T) {
@@ -33,67 +39,10 @@ func TestUnmarshalMetricAndTagsSuccess(t *testing.T) {
 			t.Fatalf("unexpected row;\ngot\n%+v\nwant\n%+v", &r, rExpected)
 		}
 	}
-	f(" ", &Row{
-		Metric: " ",
-	})
-	f("foo ;bar=baz", &Row{
-		Metric: "foo ",
-		Tags: []Tag{
-			{
-				Key:   "bar",
-				Value: "baz",
-			},
-		},
-	})
-	f("f oo;bar=baz", &Row{
-		Metric: "f oo",
-		Tags: []Tag{
-			{
-				Key:   "bar",
-				Value: "baz",
-			},
-		},
-	})
-	f("foo;bar=baz   ", &Row{
-		Metric: "foo",
-		Tags: []Tag{
-			{
-				Key:   "bar",
-				Value: "baz   ",
-			},
-		},
-	})
-	f("foo;bar= baz", &Row{
-		Metric: "foo",
-		Tags: []Tag{
-			{
-				Key:   "bar",
-				Value: " baz",
-			},
-		},
-	})
-	f("foo;bar=b az", &Row{
-		Metric: "foo",
-		Tags: []Tag{
-			{
-				Key:   "bar",
-				Value: "b az",
-			},
-		},
-	})
-	f("foo;b ar=baz", &Row{
-		Metric: "foo",
-		Tags: []Tag{
-			{
-				Key:   "b ar",
-				Value: "baz",
-			},
-		},
-	})
 	f("foo", &Row{
 		Metric: "foo",
 	})
-	f("foo;bar=123;baz=aa=bb", &Row{
+	f("foo;bar=123;baz=aabb", &Row{
 		Metric: "foo",
 		Tags: []Tag{
 			{
@@ -102,7 +51,7 @@ func TestUnmarshalMetricAndTagsSuccess(t *testing.T) {
 			},
 			{
 				Key:   "baz",
-				Value: "aa=bb",
+				Value: "aabb",
 			},
 		},
 	})
@@ -124,8 +73,15 @@ func TestRowsUnmarshalFailure(t *testing.T) {
 		}
 	}
 
+	// Missing metric
+	f(" 123 455")
+
 	// Missing value
 	f("aaa")
+
+	// unexpected space in tag value
+	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/99
+	f("s;tag1=aaa1;tag2=bb b2;tag3=ccc3 1")
 
 	// invalid value
 	f("aa bb")
@@ -146,7 +102,7 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 		// Try unmarshaling again
 		rows.Unmarshal(s)
 		if !reflect.DeepEqual(rows.Rows, rowsExpected.Rows) {
-			t.Fatalf("unexpected rows on second unmarshal;\ngot\n%+v;\nwant\n%+v", rows.Rows, rowsExpected.Rows)
+			t.Fatalf("unexpected rows;\ngot\n%+v;\nwant\n%+v", rows.Rows, rowsExpected.Rows)
 		}
 
 		rows.Reset()
@@ -162,12 +118,6 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 	f("\n\r\n", &Rows{})
 
 	// Single line
-	f(" 123 455", &Rows{
-		Rows: []Row{{
-			Metric: "123",
-			Value:  455,
-		}},
-	})
 	f("foobar -123.456 789", &Rows{
 		Rows: []Row{{
 			Metric:    "foobar",
@@ -180,26 +130,6 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 			Metric:    "foo.bar",
 			Value:     123.456,
 			Timestamp: 789,
-		}},
-	})
-
-	// Whitespace in metric name, tag name and tag value
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/3102
-	f("s a;ta g1=aaa1;tag2=bb b2;tag3 1 23", &Rows{
-		Rows: []Row{{
-			Metric:    "s a",
-			Value:     1,
-			Timestamp: 23,
-			Tags: []Tag{
-				{
-					Key:   "ta g1",
-					Value: "aaa1",
-				},
-				{
-					Key:   "tag2",
-					Value: "bb b2",
-				},
-			},
 		}},
 	})
 
@@ -328,60 +258,6 @@ func TestRowsUnmarshalSuccess(t *testing.T) {
 			},
 		},
 	})
-
-	// With tab as separator
-	// See https://github.com/grobian/carbon-c-relay/commit/f3ffe6cc2b52b07d14acbda649ad3fd6babdd528
-	f("foo.baz\t125.456\t1789\n", &Rows{
-		Rows: []Row{{
-			Metric:    "foo.baz",
-			Value:     125.456,
-			Timestamp: 1789,
-		}},
-	})
-	// With tab as separator and tags
-	f("foo;baz=bar;bb=;y=x;=z\t1\t2", &Rows{
-		Rows: []Row{{
-			Metric: "foo",
-			Tags: []Tag{
-				{
-					Key:   "baz",
-					Value: "bar",
-				},
-				{
-					Key:   "y",
-					Value: "x",
-				},
-			},
-			Value:     1,
-			Timestamp: 2,
-		}},
-	})
-
-	// Whitespace after the timestamp
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1865
-	f("foo.baz 125 1789 \na 1.34 567\t  ", &Rows{
-		Rows: []Row{
-			{
-				Metric:    "foo.baz",
-				Value:     125,
-				Timestamp: 1789,
-			},
-			{
-				Metric:    "a",
-				Value:     1.34,
-				Timestamp: 567,
-			},
-		},
-	})
-
-	// Multiple whitespaces as separators
-	f("foo.baz \t125  1789 \t\n", &Rows{
-		Rows: []Row{{
-			Metric:    "foo.baz",
-			Value:     125,
-			Timestamp: 1789,
-		}},
-	})
 }
 
 func Test_streamContext_Read(t *testing.T) {
@@ -393,8 +269,7 @@ func Test_streamContext_Read(t *testing.T) {
 		}
 		uw := getUnmarshalWork()
 		callbackCalls := 0
-		uw.ctx = ctx
-		uw.callback = func(rows []Row) error {
+		uw.callback = func(rows []Row) {
 			callbackCalls++
 			if len(rows) != len(rowsExpected.Rows) {
 				t.Fatalf("different len of expected rows;\ngot\n%+v;\nwant\n%+v", rows, rowsExpected.Rows)
@@ -402,10 +277,8 @@ func Test_streamContext_Read(t *testing.T) {
 			if !reflect.DeepEqual(rows, rowsExpected.Rows) {
 				t.Fatalf("unexpected rows;\ngot\n%+v;\nwant\n%+v", rows, rowsExpected.Rows)
 			}
-			return nil
 		}
 		uw.reqBuf = append(uw.reqBuf[:0], ctx.reqBuf...)
-		ctx.wg.Add(1)
 		uw.Unmarshal()
 		if callbackCalls != 1 {
 			t.Fatalf("unexpected number of callback calls; got %d; want 1", callbackCalls)

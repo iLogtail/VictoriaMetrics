@@ -110,7 +110,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	timestampsPath := path + "/timestamps.bin"
 	timestampsFile, err := filestream.Create(timestampsPath, nocache)
 	if err != nil {
-		fs.MustRemoveDirAtomic(path)
+		fs.MustRemoveAll(path)
 		return fmt.Errorf("cannot create timestamps file: %w", err)
 	}
 
@@ -118,7 +118,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	valuesFile, err := filestream.Create(valuesPath, nocache)
 	if err != nil {
 		timestampsFile.MustClose()
-		fs.MustRemoveDirAtomic(path)
+		fs.MustRemoveAll(path)
 		return fmt.Errorf("cannot create values file: %w", err)
 	}
 
@@ -127,7 +127,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 	if err != nil {
 		timestampsFile.MustClose()
 		valuesFile.MustClose()
-		fs.MustRemoveDirAtomic(path)
+		fs.MustRemoveAll(path)
 		return fmt.Errorf("cannot create index file: %w", err)
 	}
 
@@ -139,7 +139,7 @@ func (bsw *blockStreamWriter) InitFromFilePart(path string, nocache bool, compre
 		timestampsFile.MustClose()
 		valuesFile.MustClose()
 		indexFile.MustClose()
-		fs.MustRemoveDirAtomic(path)
+		fs.MustRemoveAll(path)
 		return fmt.Errorf("cannot create metaindex file: %w", err)
 	}
 
@@ -184,9 +184,11 @@ func (bsw *blockStreamWriter) MustClose() {
 }
 
 // WriteExternalBlock writes b to bsw and updates ph and rowsMerged.
-func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsMerged *uint64) {
+func (bsw *blockStreamWriter) WriteExternalBlock(b *Block, ph *partHeader, rowsMerged *uint64, needDedup bool) {
 	atomic.AddUint64(rowsMerged, uint64(b.rowsCount()))
-	b.deduplicateSamplesDuringMerge()
+	if needDedup {
+		b.deduplicateSamplesDuringMerge()
+	}
 	headerData, timestampsData, valuesData := b.MarshalData(bsw.timestampsBlockOffset, bsw.valuesBlockOffset)
 	usePrevTimestamps := len(bsw.prevTimestampsData) > 0 && bytes.Equal(timestampsData, bsw.prevTimestampsData)
 	if usePrevTimestamps {

@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net/http"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
@@ -15,11 +17,12 @@ import (
 
 // ParseStream parses /api/v1/import/native lines from req and calls callback for parsed blocks.
 //
-// The callback can be called concurrently multiple times for streamed data from r.
+// The callback can be called concurrently multiple times for streamed data from req.
 //
 // callback shouldn't hold block after returning.
-func ParseStream(r io.Reader, isGzip bool, callback func(block *Block) error) error {
-	if isGzip {
+func ParseStream(req *http.Request, callback func(block *Block) error) error {
+	r := req.Body
+	if req.Header.Get("Content-Encoding") == "gzip" {
 		zr, err := common.GetGzipReader(r)
 		if err != nil {
 			return fmt.Errorf("cannot read gzipped vmimport data: %w", err)
@@ -42,37 +45,49 @@ func ParseStream(r io.Reader, isGzip bool, callback func(block *Block) error) er
 
 	// Read native blocks and feed workers with work.
 	sizeBuf := make([]byte, 4)
-
-	ctx := &streamContext{}
+	var wg sync.WaitGroup
+	var (
+		callbackErrLock sync.Mutex
+		callbackErr     error
+	)
 	for {
 		uw := getUnmarshalWork()
 		uw.tr = tr
-		uw.ctx = ctx
-		uw.callback = callback
+		uw.callback = func(block *Block) {
+			if err := callback(block); err != nil {
+				processErrors.Inc()
+				callbackErrLock.Lock()
+				if callbackErr == nil {
+					callbackErr = fmt.Errorf("error when processing native block: %w", err)
+				}
+				callbackErrLock.Unlock()
+			}
+			wg.Done()
+		}
 
 		// Read uw.metricNameBuf
 		if _, err := io.ReadFull(br, sizeBuf); err != nil {
 			if err == io.EOF {
 				// End of stream
 				putUnmarshalWork(uw)
-				ctx.wg.Wait()
-				return ctx.err
+				wg.Wait()
+				return callbackErr
 			}
 			readErrors.Inc()
-			ctx.wg.Wait()
+			wg.Wait()
 			return fmt.Errorf("cannot read metricName size: %w", err)
 		}
 		readCalls.Inc()
 		bufSize := encoding.UnmarshalUint32(sizeBuf)
 		if bufSize > 1024*1024 {
 			parseErrors.Inc()
-			ctx.wg.Wait()
+			wg.Wait()
 			return fmt.Errorf("too big metricName size; got %d; shouldn't exceed %d", bufSize, 1024*1024)
 		}
-		uw.metricNameBuf = bytesutil.ResizeNoCopyMayOverallocate(uw.metricNameBuf, int(bufSize))
+		uw.metricNameBuf = bytesutil.Resize(uw.metricNameBuf, int(bufSize))
 		if _, err := io.ReadFull(br, uw.metricNameBuf); err != nil {
 			readErrors.Inc()
-			ctx.wg.Wait()
+			wg.Wait()
 			return fmt.Errorf("cannot read metricName with size %d bytes: %w", bufSize, err)
 		}
 		readCalls.Inc()
@@ -80,34 +95,28 @@ func ParseStream(r io.Reader, isGzip bool, callback func(block *Block) error) er
 		// Read uw.blockBuf
 		if _, err := io.ReadFull(br, sizeBuf); err != nil {
 			readErrors.Inc()
-			ctx.wg.Wait()
+			wg.Wait()
 			return fmt.Errorf("cannot read native block size: %w", err)
 		}
 		readCalls.Inc()
 		bufSize = encoding.UnmarshalUint32(sizeBuf)
 		if bufSize > 1024*1024 {
 			parseErrors.Inc()
-			ctx.wg.Wait()
+			wg.Wait()
 			return fmt.Errorf("too big native block size; got %d; shouldn't exceed %d", bufSize, 1024*1024)
 		}
-		uw.blockBuf = bytesutil.ResizeNoCopyMayOverallocate(uw.blockBuf, int(bufSize))
+		uw.blockBuf = bytesutil.Resize(uw.blockBuf, int(bufSize))
 		if _, err := io.ReadFull(br, uw.blockBuf); err != nil {
 			readErrors.Inc()
-			ctx.wg.Wait()
+			wg.Wait()
 			return fmt.Errorf("cannot read native block with size %d bytes: %w", bufSize, err)
 		}
 		readCalls.Inc()
 		blocksRead.Inc()
 
-		ctx.wg.Add(1)
+		wg.Add(1)
 		common.ScheduleUnmarshalWork(uw)
 	}
-}
-
-type streamContext struct {
-	wg      sync.WaitGroup
-	errLock sync.Mutex
-	err     error
 }
 
 // Block is a single block from `/api/v1/import/native` request.
@@ -135,15 +144,13 @@ var (
 
 type unmarshalWork struct {
 	tr            storage.TimeRange
-	ctx           *streamContext
-	callback      func(block *Block) error
+	callback      func(block *Block)
 	metricNameBuf []byte
 	blockBuf      []byte
 	block         Block
 }
 
 func (uw *unmarshalWork) reset() {
-	uw.ctx = nil
 	uw.callback = nil
 	uw.metricNameBuf = uw.metricNameBuf[:0]
 	uw.blockBuf = uw.blockBuf[:0]
@@ -152,22 +159,13 @@ func (uw *unmarshalWork) reset() {
 
 // Unmarshal implements common.UnmarshalWork
 func (uw *unmarshalWork) Unmarshal() {
-	err := uw.unmarshal()
-	if err != nil {
+	if err := uw.unmarshal(); err != nil {
 		parseErrors.Inc()
-	} else {
-		err = uw.callback(&uw.block)
+		logger.Errorf("error when unmarshaling native block: %s", err)
+		putUnmarshalWork(uw)
+		return
 	}
-	ctx := uw.ctx
-	if err != nil {
-		processErrors.Inc()
-		ctx.errLock.Lock()
-		if ctx.err == nil {
-			ctx.err = fmt.Errorf("error when processing native block: %w", err)
-		}
-		ctx.errLock.Unlock()
-	}
-	ctx.wg.Done()
+	uw.callback(&uw.block)
 	putUnmarshalWork(uw)
 }
 

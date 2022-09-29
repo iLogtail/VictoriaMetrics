@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
+
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promscrape/discoveryutils"
 )
 
@@ -15,6 +16,7 @@ type task struct {
 	ID                  string
 	ServiceID           string
 	NodeID              string
+	Labels              map[string]string
 	DesiredState        string
 	NetworksAttachments []struct {
 		Addresses []string
@@ -29,11 +31,6 @@ type task struct {
 		}
 		PortStatus struct {
 			Ports []portConfig
-		}
-	}
-	Spec struct {
-		ContainerSpec struct {
-			Labels map[string]string
 		}
 	}
 	Slot int
@@ -86,8 +83,8 @@ func addTasksLabels(tasks []task, nodesLabels, servicesLabels []map[string]strin
 			"__meta_dockerswarm_task_slot":          strconv.Itoa(task.Slot),
 			"__meta_dockerswarm_task_state":         task.Status.State,
 		}
-		for k, v := range task.Spec.ContainerSpec.Labels {
-			commonLabels[discoveryutils.SanitizeLabelName("__meta_dockerswarm_container_label_"+k)] = v
+		for k, v := range task.Labels {
+			commonLabels["__meta_dockerswarm_task_label_"+discoveryutils.SanitizeLabelName(k)] = v
 		}
 		var svcPorts []portConfig
 		for i, v := range services {
@@ -103,16 +100,16 @@ func addTasksLabels(tasks []task, nodesLabels, servicesLabels []map[string]strin
 			if port.Protocol != "tcp" {
 				continue
 			}
-			m := make(map[string]string, len(commonLabels)+2)
+			m := map[string]string{
+				"__address__": discoveryutils.JoinHostPort(commonLabels["__meta_dockerswarm_node_address"], port.PublishedPort),
+				"__meta_dockerswarm_task_port_publish_mode": port.PublishMode,
+			}
 			for k, v := range commonLabels {
 				m[k] = v
 			}
-			m["__address__"] = discoveryutils.JoinHostPort(commonLabels["__meta_dockerswarm_node_address"], port.PublishedPort)
-			m["__meta_dockerswarm_task_port_publish_mode"] = port.PublishMode
 			ms = append(ms, m)
 		}
 		for _, na := range task.NetworksAttachments {
-			networkLabels := networksLabels[na.Network.ID]
 			for _, address := range na.Addresses {
 				ip, _, err := net.ParseCIDR(address)
 				if err != nil {
@@ -124,27 +121,29 @@ func addTasksLabels(tasks []task, nodesLabels, servicesLabels []map[string]strin
 					if ep.Protocol != "tcp" {
 						continue
 					}
-					m := make(map[string]string, len(commonLabels)+len(networkLabels)+2)
+					m := map[string]string{
+						"__address": discoveryutils.JoinHostPort(ip.String(), ep.PublishedPort),
+						"__meta_dockerswarm_task_port_publish_mode": ep.PublishMode,
+					}
 					for k, v := range commonLabels {
 						m[k] = v
 					}
-					for k, v := range networkLabels {
+					for k, v := range networksLabels[na.Network.ID] {
 						m[k] = v
 					}
-					m["__address__"] = discoveryutils.JoinHostPort(ip.String(), ep.PublishedPort)
-					m["__meta_dockerswarm_task_port_publish_mode"] = ep.PublishMode
 					ms = append(ms, m)
 					added = true
 				}
 				if !added {
-					m := make(map[string]string, len(commonLabels)+len(networkLabels)+1)
+					m := map[string]string{
+						"__address__": discoveryutils.JoinHostPort(ip.String(), port),
+					}
 					for k, v := range commonLabels {
 						m[k] = v
 					}
-					for k, v := range networkLabels {
+					for k, v := range networksLabels[na.Network.ID] {
 						m[k] = v
 					}
-					m["__address__"] = discoveryutils.JoinHostPort(ip.String(), port)
 					ms = append(ms, m)
 				}
 			}

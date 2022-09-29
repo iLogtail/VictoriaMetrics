@@ -1,129 +1,103 @@
 package promrelabel
 
 import (
-	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
 )
 
-func TestSanitizeName(t *testing.T) {
-	f := func(s, resultExpected string) {
-		t.Helper()
-		for i := 0; i < 5; i++ {
-			result := SanitizeName(s)
-			if result != resultExpected {
-				t.Fatalf("unexpected result for SanitizeName(%q) at iteration %d; got %q; want %q", s, i, result, resultExpected)
-			}
-		}
-	}
-	f("", "")
-	f("a", "a")
-	f("foo.bar/baz:a", "foo_bar_baz:a")
-	f("foo...bar", "foo___bar")
-}
-
-func TestLabelsToString(t *testing.T) {
-	f := func(labels []prompbmarshal.Label, sExpected string) {
-		t.Helper()
-		s := labelsToString(labels)
-		if s != sExpected {
-			t.Fatalf("unexpected result;\ngot\n%s\nwant\n%s", s, sExpected)
-		}
-	}
-	f(nil, "{}")
-	f([]prompbmarshal.Label{
-		{
-			Name:  "__name__",
-			Value: "foo",
-		},
-	}, "foo")
-	f([]prompbmarshal.Label{
-		{
-			Name:  "foo",
-			Value: "bar",
-		},
-	}, `{foo="bar"}`)
-	f([]prompbmarshal.Label{
-		{
-			Name:  "foo",
-			Value: "bar",
-		},
-		{
-			Name:  "a",
-			Value: "bc",
-		},
-	}, `{a="bc",foo="bar"}`)
-	f([]prompbmarshal.Label{
-		{
-			Name:  "foo",
-			Value: "bar",
-		},
-		{
-			Name:  "__name__",
-			Value: "xxx",
-		},
-		{
-			Name:  "a",
-			Value: "bc",
-		},
-	}, `xxx{a="bc",foo="bar"}`)
-}
-
 func TestApplyRelabelConfigs(t *testing.T) {
-	f := func(config, metric string, isFinalize bool, resultExpected string) {
+	f := func(config string, labels []prompbmarshal.Label, isFinalize bool, resultExpected []prompbmarshal.Label) {
 		t.Helper()
-		pcs, err := ParseRelabelConfigsData([]byte(config), false)
+		pcs, err := ParseRelabelConfigsData([]byte(config))
 		if err != nil {
 			t.Fatalf("cannot parse %q: %s", config, err)
 		}
-		labels, err := parseMetricWithLabels(metric)
-		if err != nil {
-			t.Fatalf("cannot parse %s: %s", metric, err)
-		}
-		resultLabels := pcs.Apply(labels, 0, isFinalize)
-		result := labelsToString(resultLabels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
+		result := pcs.Apply(labels, 0, isFinalize)
+		if !reflect.DeepEqual(result, resultExpected) {
+			t.Fatalf("unexpected result; got\n%v\nwant\n%v", result, resultExpected)
 		}
 	}
 	t.Run("empty_relabel_configs", func(t *testing.T) {
-		f("", `{}`, false, `{}`)
-		f("", `{}`, true, `{}`)
-		f("", `{foo="bar"}`, false, `{foo="bar"}`)
-		f("", `xxx{foo="bar",__aaa="yyy"}`, false, `xxx{__aaa="yyy",foo="bar"}`)
-		f("", `xxx{foo="bar",__aaa="yyy"}`, true, `xxx{foo="bar"}`)
+		f("", nil, false, nil)
+		f("", nil, true, nil)
+		f("", []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+		})
+		f("", []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+			{
+				Name:  "__name__",
+				Value: "xxx",
+			},
+			{
+				Name:  "__aaa",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "__name__",
+				Value: "xxx",
+			},
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+		})
 	})
 	t.Run("replace-miss", func(t *testing.T) {
 		f(`
 - action: replace
   target_label: bar
-`, `{}`, false, `{}`)
+`, nil, false, []prompbmarshal.Label{})
 		f(`
 - action: replace
   source_labels: ["foo"]
   target_label: bar
-`, `{}`, false, `{}`)
+`, nil, false, []prompbmarshal.Label{})
 		f(`
 - action: replace
   source_labels: ["foo"]
   target_label: "bar"
-`, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 		f(`
 - action: replace
   source_labels: ["foo"]
   target_label: "bar"
   regex: ".+"
-`, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
-	})
-	t.Run("replace-if-miss", func(t *testing.T) {
-		f(`
-- action: replace
-  if: '{foo="bar"}'
-  source_labels: ["xxx", "foo"]
-  target_label: "bar"
-  replacement: "a-$1-b"
-`, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("replace-hit", func(t *testing.T) {
 		f(`
@@ -131,52 +105,21 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: ["xxx", "foo"]
   target_label: "bar"
   replacement: "a-$1-b"
-`, `{xxx="yyy"}`, false, `{bar="a-yyy;-b",xxx="yyy"}`)
-	})
-	t.Run("replace-if-hit", func(t *testing.T) {
-		f(`
-- action: replace
-  if: '{xxx=~".y."}'
-  source_labels: ["xxx", "foo"]
-  target_label: "bar"
-  replacement: "a-$1-b"
-`, `{xxx="yyy"}`, false, `{bar="a-yyy;-b",xxx="yyy"}`)
-	})
-	t.Run("replace-remove-label-value-hit", func(t *testing.T) {
-		f(`
-- action: replace
-  source_labels: ["foo"]
-  target_label: "foo"
-  regex: "xxx"
-  replacement: ""
-`, `{foo="xxx",bar="baz"}`, false, `{bar="baz"}`)
-	})
-	t.Run("replace-remove-label-value-miss", func(t *testing.T) {
-		f(`
-- action: replace
-  source_labels: ["foo"]
-  target_label: "foo"
-  regex: "xxx"
-  replacement: ""
-`, `{foo="yyy",bar="baz"}`, false, `{bar="baz",foo="yyy"}`)
-	})
-	t.Run("replace-hit-remove-label", func(t *testing.T) {
-		f(`
-- action: replace
-  source_labels: ["xxx", "foo"]
-  regex: "yyy;.+"
-  target_label: "foo"
-  replacement: ""
-`, `{xxx="yyy",foo="bar"}`, false, `{xxx="yyy"}`)
-	})
-	t.Run("replace-miss-remove-label", func(t *testing.T) {
-		f(`
-- action: replace
-  source_labels: ["xxx", "foo"]
-  regex: "yyy;.+"
-  target_label: "foo"
-  replacement: ""
-`, `{xxx="yyyz",foo="bar"}`, false, `{foo="bar",xxx="yyyz"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "bar",
+				Value: "a-yyy;-b",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("replace-hit-target-label-with-capture-group", func(t *testing.T) {
 		f(`
@@ -184,40 +127,64 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: ["xxx", "foo"]
   target_label: "bar-$1"
   replacement: "a-$1-b"
-`, `{xxx="yyy"}`, false, `{bar-yyy;="a-yyy;-b",xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "bar-yyy;",
+				Value: "a-yyy;-b",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("replace_all-miss", func(t *testing.T) {
 		f(`
 - action: replace_all
   source_labels: [foo]
   target_label: "bar"
-`, `{}`, false, `{}`)
+`, nil, false, []prompbmarshal.Label{})
 		f(`
 - action: replace_all
   source_labels: ["foo"]
   target_label: "bar"
-`, `{}`, false, `{}`)
+`, nil, false, []prompbmarshal.Label{})
 		f(`
 - action: replace_all
   source_labels: ["foo"]
   target_label: "bar"
-`, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 		f(`
 - action: replace_all
   source_labels: ["foo"]
   target_label: "bar"
   regex: ".+"
-`, `{xxx="yyy"}`, false, `{xxx="yyy"}`)
-	})
-	t.Run("replace_all-if-miss", func(t *testing.T) {
-		f(`
-- action: replace_all
-  if: 'foo'
-  source_labels: ["xxx"]
-  target_label: "xxx"
-  regex: "-"
-  replacement: "."
-`, `{xxx="a-b-c"}`, false, `{xxx="a-b-c"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("replace_all-hit", func(t *testing.T) {
 		f(`
@@ -226,17 +193,17 @@ func TestApplyRelabelConfigs(t *testing.T) {
   target_label: "xxx"
   regex: "-"
   replacement: "."
-`, `{xxx="a-b-c"}`, false, `{xxx="a.b.c"}`)
-	})
-	t.Run("replace_all-if-hit", func(t *testing.T) {
-		f(`
-- action: replace_all
-  if: '{non_existing_label=~".*"}'
-  source_labels: ["xxx"]
-  target_label: "xxx"
-  regex: "-"
-  replacement: "."
-`, `{xxx="a-b-c"}`, false, `{xxx="a.b.c"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "a-b-c",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "a.b.c",
+			},
+		})
 	})
 	t.Run("replace_all-regex-hit", func(t *testing.T) {
 		f(`
@@ -245,7 +212,17 @@ func TestApplyRelabelConfigs(t *testing.T) {
   target_label: "xxx"
   regex: "(;)"
   replacement: "-$1-"
-`, `{xxx="y;y"}`, false, `{xxx="y-;-y-;-"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "y;y",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "y-;-y-;-",
+			},
+		})
 	})
 	t.Run("replace-add-multi-labels", func(t *testing.T) {
 		f(`
@@ -257,7 +234,33 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: ["bar"]
   target_label: "zar"
   replacement: "b-$1"
-`, `{xxx="yyy",instance="a.bc"}`, true, `{bar="a-yyy",instance="a.bc",xxx="yyy",zar="b-a-yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "instance",
+				Value: "a.bc",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "bar",
+				Value: "a-yyy",
+			},
+			{
+				Name:  "instance",
+				Value: "a.bc",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "zar",
+				Value: "b-a-yyy",
+			},
+		})
 	})
 	t.Run("replace-self", func(t *testing.T) {
 		f(`
@@ -265,178 +268,200 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: ["foo"]
   target_label: "foo"
   replacement: "a-$1"
-`, `{foo="aaxx"}`, true, `{foo="a-aaxx"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "aaxx",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "a-aaxx",
+			},
+		})
 	})
 	t.Run("replace-missing-source", func(t *testing.T) {
 		f(`
 - action: replace
   target_label: foo
   replacement: "foobar"
-`, `{}`, true, `{foo="foobar"}`)
+`, []prompbmarshal.Label{}, true, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "foobar",
+			},
+		})
 	})
 	t.Run("keep_if_equal-miss", func(t *testing.T) {
 		f(`
 - action: keep_if_equal
   source_labels: ["foo", "bar"]
-`, `{}`, true, `{}`)
+`, nil, true, nil)
 		f(`
 - action: keep_if_equal
   source_labels: ["xxx", "bar"]
-`, `{xxx="yyy"}`, true, `{}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{})
 	})
 	t.Run("keep_if_equal-hit", func(t *testing.T) {
 		f(`
 - action: keep_if_equal
   source_labels: ["xxx", "bar"]
-`, `{xxx="yyy",bar="yyy"}`, true, `{bar="yyy",xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "bar",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "bar",
+				Value: "yyy",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("drop_if_equal-miss", func(t *testing.T) {
 		f(`
 - action: drop_if_equal
   source_labels: ["foo", "bar"]
-`, `{}`, true, `{}`)
+`, nil, true, nil)
 		f(`
 - action: drop_if_equal
   source_labels: ["xxx", "bar"]
-`, `{xxx="yyy"}`, true, `{xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("drop_if_equal-hit", func(t *testing.T) {
 		f(`
 - action: drop_if_equal
   source_labels: [xxx, bar]
-`, `{xxx="yyy",bar="yyy"}`, true, `{}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "bar",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{})
 	})
 	t.Run("keep-miss", func(t *testing.T) {
 		f(`
 - action: keep
   source_labels: [foo]
   regex: ".+"
-`, `{}`, true, `{}`)
+`, nil, true, nil)
 		f(`
 - action: keep
   source_labels: [foo]
   regex: ".+"
-`, `{xxx="yyy"}`, true, `{}`)
-	})
-	t.Run("keep-if-miss", func(t *testing.T) {
-		f(`
-- action: keep
-  if: '{foo="bar"}'
-`, `{foo="yyy"}`, false, `{}`)
-	})
-	t.Run("keep-if-hit", func(t *testing.T) {
-		f(`
-- action: keep
-  if: '{foo="yyy"}'
-`, `{foo="yyy"}`, false, `{foo="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{})
 	})
 	t.Run("keep-hit", func(t *testing.T) {
 		f(`
 - action: keep
   source_labels: [foo]
   regex: "yyy"
-`, `{foo="yyy"}`, false, `{foo="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("keep-hit-regexp", func(t *testing.T) {
 		f(`
 - action: keep
   source_labels: ["foo"]
   regex: ".+"
-`, `{foo="yyy"}`, false, `{foo="yyy"}`)
-	})
-	t.Run("keep_metrics-miss", func(t *testing.T) {
-		f(`
-- action: keep_metrics
-  regex:
-  - foo
-  - bar
-`, `xxx`, true, `{}`)
-	})
-	t.Run("keep_metrics-if-miss", func(t *testing.T) {
-		f(`
-- action: keep_metrics
-  if: 'bar'
-`, `foo`, true, `{}`)
-	})
-	t.Run("keep_metrics-if-hit", func(t *testing.T) {
-		f(`
-- action: keep_metrics
-  if: 'foo'
-`, `foo`, true, `foo`)
-	})
-	t.Run("keep_metrics-hit", func(t *testing.T) {
-		f(`
-- action: keep_metrics
-  regex:
-  - foo
-  - bar
-`, `foo`, true, `foo`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("drop-miss", func(t *testing.T) {
 		f(`
 - action: drop
   source_labels: [foo]
   regex: ".+"
-`, `{}`, false, `{}`)
+`, nil, false, nil)
 		f(`
 - action: drop
   source_labels: [foo]
   regex: ".+"
-`, `{xxx="yyy"}`, true, `{xxx="yyy"}`)
-	})
-	t.Run("drop-if-miss", func(t *testing.T) {
-		f(`
-- action: drop
-  if: '{foo="bar"}'
-`, `{foo="yyy"}`, true, `{foo="yyy"}`)
-	})
-	t.Run("drop-if-hit", func(t *testing.T) {
-		f(`
-- action: drop
-  if: '{foo="yyy"}'
-`, `{foo="yyy"}`, true, `{}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("drop-hit", func(t *testing.T) {
 		f(`
 - action: drop
   source_labels: [foo]
   regex: yyy
-`, `{foo="yyy"}`, true, `{}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{})
 	})
 	t.Run("drop-hit-regexp", func(t *testing.T) {
 		f(`
 - action: drop
   source_labels: [foo]
   regex: ".+"
-`, `{foo="yyy"}`, true, `{}`)
-	})
-	t.Run("drop_metrics-miss", func(t *testing.T) {
-		f(`
-- action: drop_metrics
-  regex:
-  - foo
-  - bar
-`, `xxx`, true, `xxx`)
-	})
-	t.Run("drop_metrics-if-miss", func(t *testing.T) {
-		f(`
-- action: drop_metrics
-  if: bar
-`, `foo`, true, `foo`)
-	})
-	t.Run("drop_metrics-if-hit", func(t *testing.T) {
-		f(`
-- action: drop_metrics
-  if: foo
-`, `foo`, true, `{}`)
-	})
-	t.Run("drop_metrics-hit", func(t *testing.T) {
-		f(`
-- action: drop_metrics
-  regex:
-  - foo
-  - bar
-`, `foo`, true, `{}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{})
 	})
 	t.Run("hashmod-miss", func(t *testing.T) {
 		f(`
@@ -444,25 +469,21 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: [foo]
   target_label: aaa
   modulus: 123
-`, `{xxx="yyy"}`, false, `{aaa="81",xxx="yyy"}`)
-	})
-	t.Run("hashmod-if-miss", func(t *testing.T) {
-		f(`
-- action: hashmod
-  if: '{foo="bar"}'
-  source_labels: [foo]
-  target_label: aaa
-  modulus: 123
-`, `{foo="yyy"}`, true, `{foo="yyy"}`)
-	})
-	t.Run("hashmod-if-hit", func(t *testing.T) {
-		f(`
-- action: hashmod
-  if: '{foo="yyy"}'
-  source_labels: [foo]
-  target_label: aaa
-  modulus: 123
-`, `{foo="yyy"}`, true, `{aaa="73",foo="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "81",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("hashmod-hit", func(t *testing.T) {
 		f(`
@@ -470,330 +491,494 @@ func TestApplyRelabelConfigs(t *testing.T) {
   source_labels: [foo]
   target_label: aaa
   modulus: 123
-`, `{foo="yyy"}`, true, `{aaa="73",foo="yyy"}`)
-	})
-	t.Run("labelmap-copy-label-if-miss", func(t *testing.T) {
-		f(`
-- action: labelmap
-  if: '{foo="yyy",foobar="aab"}'
-  regex: "foo"
-  replacement: "bar"
-`, `{foo="yyy",foobar="aaa"}`, true, `{foo="yyy",foobar="aaa"}`)
-	})
-	t.Run("labelmap-copy-label-if-hit", func(t *testing.T) {
-		f(`
-- action: labelmap
-  if: '{foo="yyy",foobar="aaa"}'
-  regex: "foo"
-  replacement: "bar"
-`, `{foo="yyy",foobar="aaa"}`, true, `{bar="yyy",foo="yyy",foobar="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "73",
+			},
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("labelmap-copy-label", func(t *testing.T) {
 		f(`
 - action: labelmap
   regex: "foo"
   replacement: "bar"
-`, `{foo="yyy",foobar="aaa"}`, true, `{bar="yyy",foo="yyy",foobar="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "bar",
+				Value: "yyy",
+			},
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		})
 	})
 	t.Run("labelmap-remove-prefix-dot-star", func(t *testing.T) {
 		f(`
 - action: labelmap
   regex: "foo(.*)"
-`, `{xoo="yyy",foobar="aaa"}`, true, `{bar="aaa",foobar="aaa",xoo="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xoo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "bar",
+				Value: "aaa",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+			{
+				Name:  "xoo",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("labelmap-remove-prefix-dot-plus", func(t *testing.T) {
 		f(`
 - action: labelmap
   regex: "foo(.+)"
-`, `{foo="yyy",foobar="aaa"}`, true, `{bar="aaa",foo="yyy",foobar="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "bar",
+				Value: "aaa",
+			},
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		})
 	})
 	t.Run("labelmap-regex", func(t *testing.T) {
 		f(`
 - action: labelmap
   regex: "foo(.+)"
   replacement: "$1-x"
-`, `{foo="yyy",foobar="aaa"}`, true, `{bar-x="aaa",foo="yyy",foobar="aaa"}`)
-	})
-	t.Run("labelmap_all-if-miss", func(t *testing.T) {
-		f(`
-- action: labelmap_all
-  if: foobar
-  regex: "\\."
-  replacement: "-"
-`, `{foo.bar.baz="yyy",foobar="aaa"}`, true, `{foo.bar.baz="yyy",foobar="aaa"}`)
-	})
-	t.Run("labelmap_all-if-hit", func(t *testing.T) {
-		f(`
-- action: labelmap_all
-  if: '{foo.bar.baz="yyy"}'
-  regex: "\\."
-  replacement: "-"
-`, `{foo.bar.baz="yyy",foobar="aaa"}`, true, `{foo-bar-baz="yyy",foobar="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "bar-x",
+				Value: "aaa",
+			},
+			{
+				Name:  "foo",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		})
 	})
 	t.Run("labelmap_all", func(t *testing.T) {
 		f(`
 - action: labelmap_all
   regex: "\\."
   replacement: "-"
-`, `{foo.bar.baz="yyy",foobar="aaa"}`, true, `{foo-bar-baz="yyy",foobar="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo.bar.baz",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "foo-bar-baz",
+				Value: "yyy",
+			},
+			{
+				Name:  "foobar",
+				Value: "aaa",
+			},
+		})
 	})
 	t.Run("labelmap_all-regexp", func(t *testing.T) {
 		f(`
 - action: labelmap_all
   regex: "ba(.)"
   replacement: "${1}ss"
-`, `{foo.bar.baz="yyy",foozar="aaa"}`, true, `{foo.rss.zss="yyy",foozar="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "foo.bar.baz",
+				Value: "yyy",
+			},
+			{
+				Name:  "foozar",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "foo.rss.zss",
+				Value: "yyy",
+			},
+			{
+				Name:  "foozar",
+				Value: "aaa",
+			},
+		})
 	})
 	t.Run("labeldrop", func(t *testing.T) {
 		f(`
 - action: labeldrop
   regex: dropme
-`, `{aaa="bbb"}`, true, `{aaa="bbb"}`)
-		// if-miss
-		f(`
-- action: labeldrop
-  if: foo
-  regex: dropme
-`, `{xxx="yyy",dropme="aaa",foo="bar"}`, false, `{dropme="aaa",foo="bar",xxx="yyy"}`)
-		// if-hit
-		f(`
-- action: labeldrop
-  if: '{xxx="yyy"}'
-  regex: dropme
-`, `{xxx="yyy",dropme="aaa",foo="bar"}`, false, `{foo="bar",xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "bbb",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "bbb",
+			},
+		})
 		f(`
 - action: labeldrop
   regex: dropme
-`, `{xxx="yyy",dropme="aaa",foo="bar"}`, false, `{foo="bar",xxx="yyy"}`)
-		// regex in single quotes
-		f(`
-- action: labeldrop
-  regex: 'dropme'
-`, `{xxx="yyy",dropme="aaa"}`, false, `{xxx="yyy"}`)
-		// regex in double quotes
-		f(`
-- action: labeldrop
-  regex: "dropme"
-`, `{xxx="yyy",dropme="aaa"}`, false, `{xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "dropme",
+				Value: "aaa",
+			},
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("labeldrop-prefix", func(t *testing.T) {
 		f(`
 - action: labeldrop
   regex: "dropme.*"
-`, `{aaa="bbb"}`, true, `{aaa="bbb"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "bbb",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "bbb",
+			},
+		})
 		f(`
 - action: labeldrop
   regex: "dropme(.+)"
-`, `{xxx="yyy",dropme-please="aaa",foo="bar"}`, false, `{foo="bar",xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "dropme-please",
+				Value: "aaa",
+			},
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("labeldrop-regexp", func(t *testing.T) {
 		f(`
 - action: labeldrop
   regex: ".*dropme.*"
-`, `{aaa="bbb"}`, true, `{aaa="bbb"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "bbb",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "aaa",
+				Value: "bbb",
+			},
+		})
 		f(`
 - action: labeldrop
   regex: ".*dropme.*"
-`, `{xxx="yyy",dropme-please="aaa",foo="bar"}`, false, `{foo="bar",xxx="yyy"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+			{
+				Name:  "dropme-please",
+				Value: "aaa",
+			},
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "foo",
+				Value: "bar",
+			},
+			{
+				Name:  "xxx",
+				Value: "yyy",
+			},
+		})
 	})
 	t.Run("labelkeep", func(t *testing.T) {
 		f(`
 - action: labelkeep
   regex: "keepme"
-`, `{keepme="aaa"}`, true, `{keepme="aaa"}`)
-		// if-miss
-		f(`
-- action: labelkeep
-  if: '{aaaa="awefx"}'
-  regex: keepme
-`, `{keepme="aaa",aaaa="awef",keepme-aaa="234"}`, false, `{aaaa="awef",keepme="aaa",keepme-aaa="234"}`)
-		// if-hit
-		f(`
-- action: labelkeep
-  if: '{aaaa="awef"}'
-  regex: keepme
-`, `{keepme="aaa",aaaa="awef",keepme-aaa="234"}`, false, `{keepme="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+		})
 		f(`
 - action: labelkeep
   regex: keepme
-`, `{keepme="aaa",aaaa="awef",keepme-aaa="234"}`, false, `{keepme="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+			{
+				Name:  "aaaa",
+				Value: "awef",
+			},
+			{
+				Name:  "keepme-aaa",
+				Value: "234",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+		})
 	})
 	t.Run("labelkeep-regexp", func(t *testing.T) {
 		f(`
 - action: labelkeep
   regex: "keepme.*"
-`, `{keepme="aaa"}`, true, `{keepme="aaa"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+		}, true, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+		})
 		f(`
 - action: labelkeep
   regex: "keepme.*"
-`, `{keepme="aaa",aaaa="awef",keepme-aaa="234"}`, false, `{keepme="aaa",keepme-aaa="234"}`)
-	})
-	t.Run("upper-lower-case", func(t *testing.T) {
-		f(`
-- action: uppercase
-  source_labels: ["foo"]
-  target_label: foo
-`, `{foo="bar"}`, true, `{foo="BAR"}`)
-		f(`
-- action: lowercase
-  source_labels: ["foo", "bar"]
-  target_label: baz
-- action: labeldrop
-  regex: foo|bar
-`, `{foo="BaR",bar="fOO"}`, true, `{baz="bar;foo"}`)
-		f(`
-- action: lowercase
-  source_labels: ["foo"]
-  target_label: baz
-- action: uppercase
-  source_labels: ["bar"]
-  target_label: baz
-`, `{qux="quux"}`, true, `{qux="quux"}`)
-	})
-	t.Run("graphite-match", func(t *testing.T) {
-		f(`
-- action: graphite
-  match: foo.*.baz
-  labels:
-    __name__: aaa
-    job: ${1}-zz
-`, `foo.bar.baz`, true, `aaa{job="bar-zz"}`)
-	})
-	t.Run("graphite-mismatch", func(t *testing.T) {
-		f(`
-- action: graphite
-  match: foo.*.baz
-  labels:
-    __name__: aaa
-    job: ${1}-zz
-`, `foo.bar.bazz`, true, `foo.bar.bazz`)
-	})
-	t.Run("replacement-with-label-refs", func(t *testing.T) {
-		// no regex
-		f(`
-- target_label: abc
-  replacement: "{{__name__}}.{{foo}}"
-`, `qwe{foo="bar",baz="aaa"}`, true, `qwe{abc="qwe.bar",baz="aaa",foo="bar"}`)
-		// with regex
-		f(`
-- target_label: abc
-  replacement: "{{__name__}}.{{foo}}.$1"
-  source_labels: [baz]
-  regex: "a(.+)"
-`, `qwe{foo="bar",baz="aaa"}`, true, `qwe{abc="qwe.bar.aa",baz="aaa",foo="bar"}`)
+`, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+			{
+				Name:  "aaaa",
+				Value: "awef",
+			},
+			{
+				Name:  "keepme-aaa",
+				Value: "234",
+			},
+		}, false, []prompbmarshal.Label{
+			{
+				Name:  "keepme",
+				Value: "aaa",
+			},
+			{
+				Name:  "keepme-aaa",
+				Value: "234",
+			},
+		})
 	})
 }
 
 func TestFinalizeLabels(t *testing.T) {
-	f := func(metric, resultExpected string) {
+	f := func(labels, resultExpected []prompbmarshal.Label) {
 		t.Helper()
-		labels, err := parseMetricWithLabels(metric)
-		if err != nil {
-			t.Fatalf("cannot parse %s: %s", metric, err)
-		}
-		resultLabels := FinalizeLabels(nil, labels)
-		result := labelsToString(resultLabels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result; got\n%s\nwant\n%s", result, resultExpected)
+		result := FinalizeLabels(nil, labels)
+		if !reflect.DeepEqual(result, resultExpected) {
+			t.Fatalf("unexpected result; got\n%v\nwant\n%v", result, resultExpected)
 		}
 	}
-	f(`{}`, `{}`)
-	f(`{foo="bar",__aaa="ass",instance="foo.com"}`, `{foo="bar",instance="foo.com"}`)
-	f(`{foo="bar",instance="ass",__address__="foo.com"}`, `{foo="bar",instance="ass"}`)
-	f(`{foo="bar",abc="def",__address__="foo.com"}`, `{abc="def",foo="bar"}`)
+	f(nil, nil)
+	f([]prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+		{
+			Name:  "__aaa",
+			Value: "ass",
+		},
+		{
+			Name:  "instance",
+			Value: "foo.com",
+		},
+	}, []prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+		{
+			Name:  "instance",
+			Value: "foo.com",
+		},
+	})
+	f([]prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+		{
+			Name:  "instance",
+			Value: "ass",
+		},
+		{
+			Name:  "__address__",
+			Value: "foo.com",
+		},
+	}, []prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+		{
+			Name:  "instance",
+			Value: "ass",
+		},
+	})
 }
 
 func TestRemoveMetaLabels(t *testing.T) {
-	f := func(metric, resultExpected string) {
+	f := func(labels, resultExpected []prompbmarshal.Label) {
 		t.Helper()
-		labels, err := parseMetricWithLabels(metric)
-		if err != nil {
-			t.Fatalf("cannot parse %s: %s", metric, err)
-		}
-		resultLabels := RemoveMetaLabels(nil, labels)
-		result := labelsToString(resultLabels)
-		if result != resultExpected {
-			t.Fatalf("unexpected result of RemoveMetaLabels;\ngot\n%s\nwant\n%s", result, resultExpected)
+		result := RemoveMetaLabels(nil, labels)
+		if !reflect.DeepEqual(result, resultExpected) {
+			t.Fatalf("unexpected result of RemoveMetaLabels;\ngot\n%v\nwant\n%v", result, resultExpected)
 		}
 	}
-	f(`{}`, `{}`)
-	f(`{foo="bar"}`, `{foo="bar"}`)
-	f(`{__meta_foo="bar"}`, `{}`)
-	f(`{__meta_foo="bdffr",foo="bar",__meta_xxx="basd"}`, `{foo="bar"}`)
-}
-
-func TestFillLabelReferences(t *testing.T) {
-	f := func(replacement, metric, resultExpected string) {
-		t.Helper()
-		labels, err := parseMetricWithLabels(metric)
-		if err != nil {
-			t.Fatalf("cannot parse %s: %s", metric, err)
-		}
-		result := fillLabelReferences(nil, replacement, labels)
-		if string(result) != resultExpected {
-			t.Fatalf("unexpected result; got\n%q\nwant\n%q", result, resultExpected)
-		}
-	}
-	f(``, `foo{bar="baz"}`, ``)
-	f(`abc`, `foo{bar="baz"}`, `abc`)
-	f(`foo{{bar`, `foo{bar="baz"}`, `foo{{bar`)
-	f(`foo-$1`, `foo{bar="baz"}`, `foo-$1`)
-	f(`foo{{bar}}`, `foo{bar="baz"}`, `foobaz`)
-	f(`{{bar}}`, `foo{bar="baz"}`, `baz`)
-	f(`{{bar}}-aa`, `foo{bar="baz"}`, `baz-aa`)
-	f(`{{bar}}-aa{{__name__}}.{{bar}}{{non-existing-label}}`, `foo{bar="baz"}`, `baz-aafoo.baz`)
-}
-
-func TestRegexMatchStringSuccess(t *testing.T) {
-	f := func(pattern, s string) {
-		t.Helper()
-		prc := newTestRegexRelabelConfig(pattern)
-		if !prc.regex.MatchString(s) {
-			t.Fatalf("unexpected MatchString(%q) result; got false; want true", s)
-		}
-	}
-	f("", "")
-	f("foo", "foo")
-	f(".*", "")
-	f(".*", "foo")
-	f("foo.*", "foobar")
-	f("foo.+", "foobar")
-	f("f.+o", "foo")
-	f("foo|bar", "bar")
-	f("^(foo|bar)$", "foo")
-	f("foo.+", "foobar")
-	f("^foo$", "foo")
-}
-
-func TestRegexpMatchStringFailure(t *testing.T) {
-	f := func(pattern, s string) {
-		t.Helper()
-		prc := newTestRegexRelabelConfig(pattern)
-		if prc.regex.MatchString(s) {
-			t.Fatalf("unexpected MatchString(%q) result; got true; want false", s)
-		}
-	}
-	f("", "foo")
-	f("foo", "")
-	f("foo.*", "foa")
-	f("foo.+", "foo")
-	f("f.+o", "foor")
-	f("foo|bar", "barz")
-	f("^(foo|bar)$", "xfoo")
-	f("foo.+", "foo")
-	f("^foo$", "foobar")
-}
-
-func newTestRegexRelabelConfig(pattern string) *parsedRelabelConfig {
-	rc := &RelabelConfig{
-		Action: "labeldrop",
-		Regex: &MultiLineRegex{
-			S: pattern,
+	f(nil, nil)
+	f([]prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
 		},
-	}
-	prc, err := parseRelabelConfig(rc)
-	if err != nil {
-		panic(fmt.Errorf("unexpected error in parseRelabelConfig: %s", err))
-	}
-	return prc
+	}, []prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+	})
+	f([]prompbmarshal.Label{
+		{
+			Name:  "__meta_foo",
+			Value: "bar",
+		},
+	}, nil)
+	f([]prompbmarshal.Label{
+		{
+			Name:  "__meta_foo",
+			Value: "bdffr",
+		},
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+		{
+			Name:  "__meta_xxx",
+			Value: "basd",
+		},
+	}, []prompbmarshal.Label{
+		{
+			Name:  "foo",
+			Value: "bar",
+		},
+	})
 }

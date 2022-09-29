@@ -1,7 +1,6 @@
 package graphite
 
 import (
-	"flag"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -18,13 +17,14 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
-var maxTagValueSuffixes = flag.Int("search.maxTagValueSuffixesPerSearch", 100e3, "The maximum number of tag value suffixes returned from /metrics/find")
-
 // MetricsFindHandler implements /metrics/find handler.
 //
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-find
 func MetricsFindHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	if err := r.ParseForm(); err != nil {
+		return fmt.Errorf("cannot parse form values: %w", err)
+	}
 	format := r.FormValue("format")
 	if format == "" {
 		format = "treejson"
@@ -119,6 +119,9 @@ func deduplicatePaths(paths []string, delimiter string) []string {
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-expand
 func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	if err := r.ParseForm(); err != nil {
+		return fmt.Errorf("cannot parse form values: %w", err)
+	}
 	queries := r.Form["query"]
 	if len(queries) == 0 {
 		return fmt.Errorf("missing `query` arg")
@@ -199,9 +202,11 @@ func MetricsExpandHandler(startTime time.Time, w http.ResponseWriter, r *http.Re
 // See https://graphite-api.readthedocs.io/en/latest/api.html#metrics-index-json
 func MetricsIndexHandler(startTime time.Time, w http.ResponseWriter, r *http.Request) error {
 	deadline := searchutils.GetDeadlineForQuery(r, startTime)
+	if err := r.ParseForm(); err != nil {
+		return fmt.Errorf("cannot parse form values: %w", err)
+	}
 	jsonp := r.FormValue("jsonp")
-	sq := storage.NewSearchQuery(0, 0, nil, 0)
-	metricNames, err := netstorage.LabelValues(nil, "__name__", sq, 0, deadline)
+	metricNames, err := netstorage.GetLabelValues("__name__", deadline)
 	if err != nil {
 		return fmt.Errorf(`cannot obtain metric names: %w`, err)
 	}
@@ -222,7 +227,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 	n := strings.IndexAny(qTail, "*{[")
 	if n < 0 {
 		query := qHead + qTail
-		suffixes, err := netstorage.TagValueSuffixes(nil, tr, label, query, delimiter, *maxTagValueSuffixes, deadline)
+		suffixes, err := netstorage.GetTagValueSuffixes(tr, label, query, delimiter, deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -242,7 +247,7 @@ func metricsFind(tr storage.TimeRange, label, qHead, qTail string, delimiter byt
 	}
 	if n == len(qTail)-1 && strings.HasSuffix(qTail, "*") {
 		query := qHead + qTail[:len(qTail)-1]
-		suffixes, err := netstorage.TagValueSuffixes(nil, tr, label, query, delimiter, *maxTagValueSuffixes, deadline)
+		suffixes, err := netstorage.GetTagValueSuffixes(tr, label, query, delimiter, deadline)
 		if err != nil {
 			return nil, err
 		}
@@ -451,7 +456,7 @@ const maxRegexpCacheSize = 10000
 
 func getContentType(jsonp string) string {
 	if jsonp == "" {
-		return "application/json"
+		return "application/json; charset=utf-8"
 	}
 	return "text/javascript; charset=utf-8"
 }

@@ -1,27 +1,27 @@
 ### Snap integration
 
-<https://snapcraft.io/>
+https://snapcraft.io/
 
-snap link: <https://snapcraft.io/victoriametrics>
+snap link: https://snapcraft.io/victoriametrics
+
 
 #### develop
 
-Install snapcraft or docker
-
-build snap package with command
-
- ```console
-make build-snap
+Install snapcraft and multipass:
+ ```text
+sudo snap install snapcraft --classic
 ```
 
+build victoria-metrics prod binary and run snapcraft ```snapcraft --debug```. 
 It produces snap package with current git version - `victoriametrics_v1.46.0+git1.1bebd021a-dirty_all.snap`.
 You can install it with command: `snap install victoriametrics_v1.46.0+git1.1bebd021a-dirty_all.snap --dangerous`
 
-#### usage
+
+#### usage 
 
 installation and configuration:
 
-```console
+```text
 # install
 snap install victoriametrics
 # logs
@@ -33,16 +33,13 @@ snap logs victoriametrics
 Configuration management:
 
  Prometheus scrape config can be edited with your favorite editor, its located at
-
-```console
+```text
 vi /var/snap/victoriametrics/current/etc/victoriametrics-scrape-config.yaml
 ```
-
 after changes, you can trigger config reread with `curl localhost:8248/-/reload`.
 
 Configuration tuning is possible with editing extra_flags:
-
-```console
+```text
 echo 'FLAGS="-selfScrapeInterval=10s -search.logSlowQueryDuration=20s"' > /var/snap/victoriametrics/current/extra_flags
 snap restart victoriametrics
 ```

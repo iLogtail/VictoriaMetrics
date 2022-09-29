@@ -4,13 +4,10 @@ import (
 	"fmt"
 
 	"github.com/urfave/cli/v2"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/stepper"
 )
 
 const (
-	globalSilent  = "s"
-	globalVerbose = "verbose"
+	globalSilent = "s"
 )
 
 var (
@@ -19,11 +16,6 @@ var (
 			Name:  globalSilent,
 			Value: false,
 			Usage: "Whether to run in silent mode. If set to true no confirmation prompts will appear.",
-		},
-		&cli.BoolFlag{
-			Name:  globalVerbose,
-			Value: false,
-			Usage: "Whether to enable verbosity in logs output.",
 		},
 	}
 )
@@ -38,11 +30,7 @@ const (
 	vmBatchSize          = "vm-batch-size"
 	vmSignificantFigures = "vm-significant-figures"
 	vmRoundDigits        = "vm-round-digits"
-	vmDisableProgressBar = "vm-disable-progress-bar"
-
-	// also used in vm-native
-	vmExtraLabel = "vm-extra-label"
-	vmRateLimit  = "vm-rate-limit"
+	vmExtraLabel         = "vm-extra-label"
 )
 
 var (
@@ -51,8 +39,7 @@ var (
 			Name:  vmAddr,
 			Value: "http://localhost:8428",
 			Usage: "VictoriaMetrics address to perform import requests. \n" +
-				"Should be the same as --httpListenAddr value for single-node version or vminsert component. \n" +
-				"When importing into the clustered version do not forget to set additionally --vm-account-id flag. \n" +
+				"Should be the same as --httpListenAddr value for single-node version or VMInsert component. \n" +
 				"Please note, that `vmctl` performs initial readiness check for the given address by checking `/health` endpoint.",
 		},
 		&cli.StringFlag{
@@ -68,7 +55,6 @@ var (
 		&cli.StringFlag{
 			Name: vmAccountID,
 			Usage: "AccountID is an arbitrary 32-bit integer identifying namespace for data ingestion (aka tenant). \n" +
-				"AccountID is required when importing into the clustered version of VictoriaMetrics. \n" +
 				"It is possible to set it as accountID:projectID, where projectID is also arbitrary 32-bit integer. \n" +
 				"If projectID isn't set, then it equals to 0",
 		},
@@ -107,87 +93,6 @@ var (
 			Usage: "Extra labels, that will be added to imported timeseries. In case of collision, label value defined by flag" +
 				"will have priority. Flag can be set multiple times, to add few additional labels.",
 		},
-		&cli.Int64Flag{
-			Name: vmRateLimit,
-			Usage: "Optional data transfer rate limit in bytes per second.\n" +
-				"By default the rate limit is disabled. It can be useful for limiting load on configured via '--vmAddr' destination.",
-		},
-		&cli.BoolFlag{
-			Name:  vmDisableProgressBar,
-			Usage: "Whether to disable progress bar per each worker during the import.",
-		},
-	}
-)
-
-const (
-	otsdbAddr        = "otsdb-addr"
-	otsdbConcurrency = "otsdb-concurrency"
-	otsdbQueryLimit  = "otsdb-query-limit"
-	otsdbOffsetDays  = "otsdb-offset-days"
-	otsdbHardTSStart = "otsdb-hard-ts-start"
-	otsdbRetentions  = "otsdb-retentions"
-	otsdbFilters     = "otsdb-filters"
-	otsdbNormalize   = "otsdb-normalize"
-	otsdbMsecsTime   = "otsdb-msecstime"
-)
-
-var (
-	otsdbFlags = []cli.Flag{
-		&cli.StringFlag{
-			Name:     otsdbAddr,
-			Value:    "http://localhost:4242",
-			Required: true,
-			Usage:    "OpenTSDB server addr",
-		},
-		&cli.IntFlag{
-			Name:  otsdbConcurrency,
-			Usage: "Number of concurrently running fetch queries to OpenTSDB per metric",
-			Value: 1,
-		},
-		&cli.StringSliceFlag{
-			Name:     otsdbRetentions,
-			Value:    nil,
-			Required: true,
-			Usage: "Retentions patterns to collect on. Each pattern should describe the aggregation performed " +
-				"for the query, the row size (in HBase) that will define how long each individual query is, " +
-				"and the time range to query for. e.g. sum-1m-avg:1h:3d. " +
-				"The first time range defined should be a multiple of the row size in HBase. " +
-				"e.g. if the row size is 2 hours, 4h is good, 5h less so. We want each query to land on unique rows.",
-		},
-		&cli.StringSliceFlag{
-			Name:  otsdbFilters,
-			Value: cli.NewStringSlice("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"),
-			Usage: "Filters to process for discovering metrics in OpenTSDB",
-		},
-		&cli.Int64Flag{
-			Name:  otsdbOffsetDays,
-			Usage: "Days to offset our 'starting' point for collecting data from OpenTSDB",
-			Value: 0,
-		},
-		&cli.Int64Flag{
-			Name:  otsdbHardTSStart,
-			Usage: "A specific timestamp to start from, will override using an offset",
-			Value: 0,
-		},
-		/*
-			because the defaults are set *extremely* low in OpenTSDB (10-25 results), we will
-			set a larger default limit, but still allow a user to increase/decrease it
-		*/
-		&cli.IntFlag{
-			Name:  otsdbQueryLimit,
-			Usage: "Result limit on meta queries to OpenTSDB (affects both metric name and tag value queries, recommended to use a value exceeding your largest series)",
-			Value: 100e6,
-		},
-		&cli.BoolFlag{
-			Name:  otsdbMsecsTime,
-			Value: false,
-			Usage: "Whether OpenTSDB is writing values in milliseconds or seconds",
-		},
-		&cli.BoolFlag{
-			Name:  otsdbNormalize,
-			Value: false,
-			Usage: "Whether to normalize all data received to lower case before forwarding to VictoriaMetrics",
-		},
 	}
 )
 
@@ -203,8 +108,6 @@ const (
 	influxFilterTimeStart           = "influx-filter-time-start"
 	influxFilterTimeEnd             = "influx-filter-time-end"
 	influxMeasurementFieldSeparator = "influx-measurement-field-separator"
-	influxSkipDatabaseLabel         = "influx-skip-database-label"
-	influxPrometheusMode            = "influx-prometheus-mode"
 )
 
 var (
@@ -212,26 +115,26 @@ var (
 		&cli.StringFlag{
 			Name:  influxAddr,
 			Value: "http://localhost:8086",
-			Usage: "InfluxDB server addr",
+			Usage: "Influx server addr",
 		},
 		&cli.StringFlag{
 			Name:    influxUser,
-			Usage:   "InfluxDB user",
+			Usage:   "Influx user",
 			EnvVars: []string{"INFLUX_USERNAME"},
 		},
 		&cli.StringFlag{
 			Name:    influxPassword,
-			Usage:   "InfluxDB user password",
+			Usage:   "Influx user password",
 			EnvVars: []string{"INFLUX_PASSWORD"},
 		},
 		&cli.StringFlag{
 			Name:     influxDB,
-			Usage:    "InfluxDB database",
+			Usage:    "Influx database",
 			Required: true,
 		},
 		&cli.StringFlag{
 			Name:  influxRetention,
-			Usage: "InfluxDB retention policy",
+			Usage: "Influx retention policy",
 			Value: "autogen",
 		},
 		&cli.IntFlag{
@@ -246,7 +149,7 @@ var (
 		},
 		&cli.StringFlag{
 			Name: influxFilterSeries,
-			Usage: "InfluxDB filter expression to select series. E.g. \"from cpu where arch='x86' AND hostname='host_2753'\".\n" +
+			Usage: "Influx filter expression to select series. E.g. \"from cpu where arch='x86' AND hostname='host_2753'\".\n" +
 				"See for details https://docs.influxdata.com/influxdb/v1.7/query_language/schema_exploration#show-series",
 		},
 		&cli.StringFlag{
@@ -261,16 +164,6 @@ var (
 			Name:  influxMeasurementFieldSeparator,
 			Usage: "The {separator} symbol used to concatenate {measurement} and {field} names into series name {measurement}{separator}{field}.",
 			Value: "_",
-		},
-		&cli.BoolFlag{
-			Name:  influxSkipDatabaseLabel,
-			Usage: "Wether to skip adding the label 'db' to timeseries.",
-			Value: false,
-		},
-		&cli.BoolFlag{
-			Name:  influxPrometheusMode,
-			Usage: "Wether to restore the original timeseries name previously written from Prometheus to InfluxDB v1 via remote_write.",
-			Value: false,
 		},
 	}
 )
@@ -320,7 +213,6 @@ const (
 	vmNativeFilterMatch     = "vm-native-filter-match"
 	vmNativeFilterTimeStart = "vm-native-filter-time-start"
 	vmNativeFilterTimeEnd   = "vm-native-filter-time-end"
-	vmNativeStepInterval    = "vm-native-step-interval"
 
 	vmNativeSrcAddr     = "vm-native-src-addr"
 	vmNativeSrcUser     = "vm-native-src-user"
@@ -349,14 +241,10 @@ var (
 			Usage: "The time filter may contain either unix timestamp in seconds or RFC3339 values. E.g. '2020-01-01T20:07:00Z'",
 		},
 		&cli.StringFlag{
-			Name:  vmNativeStepInterval,
-			Usage: fmt.Sprintf("Split export data into chunks. Requires setting --%s. Valid values are '%s','%s','%s'.", vmNativeFilterTimeStart, stepper.StepMonth, stepper.StepDay, stepper.StepHour),
-		},
-		&cli.StringFlag{
 			Name: vmNativeSrcAddr,
 			Usage: "VictoriaMetrics address to perform export from. \n" +
-				" Should be the same as --httpListenAddr value for single-node version or vmselect component." +
-				" If exporting from cluster version see https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#url-format",
+				" Should be the same as --httpListenAddr value for single-node version or VMSelect component." +
+				" If exporting from cluster version - include the tenet token in address.",
 			Required: true,
 		},
 		&cli.StringFlag{
@@ -372,8 +260,8 @@ var (
 		&cli.StringFlag{
 			Name: vmNativeDstAddr,
 			Usage: "VictoriaMetrics address to perform import to. \n" +
-				" Should be the same as --httpListenAddr value for single-node version or vminsert component." +
-				" If importing into cluster version see https://docs.victoriametrics.com/Cluster-VictoriaMetrics.html#url-format",
+				" Should be the same as --httpListenAddr value for single-node version or VMInsert component." +
+				" If importing into cluster version - include the tenet token in address.",
 			Required: true,
 		},
 		&cli.StringFlag{
@@ -391,11 +279,6 @@ var (
 			Value: nil,
 			Usage: "Extra labels, that will be added to imported timeseries. In case of collision, label value defined by flag" +
 				"will have priority. Flag can be set multiple times, to add few additional labels.",
-		},
-		&cli.Int64Flag{
-			Name: vmRateLimit,
-			Usage: "Optional data transfer rate limit in bytes per second.\n" +
-				"By default the rate limit is disabled. It can be useful for limiting load on source or destination databases.",
 		},
 	}
 )

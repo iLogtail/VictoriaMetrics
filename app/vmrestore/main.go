@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/actions"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/backup/common"
@@ -12,15 +11,12 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envflag"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/httpserver"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/pushmetrics"
 )
 
 var (
-	httpListenAddr = flag.String("httpListenAddr", ":8421", "TCP address for exporting metrics at /metrics page")
-	src            = flag.String("src", "", "Source path with backup on the remote storage. "+
-		"Example: gs://bucket/path/to/backup/dir, s3://bucket/path/to/backup/dir or fs:///path/to/local/backup/dir")
+	src = flag.String("src", "", "Source path with backup on the remote storage. "+
+		"Example: gcs://bucket/path/to/backup/dir, s3://bucket/path/to/backup/dir or fs:///path/to/local/backup/dir")
 	storageDataPath = flag.String("storageDataPath", "victoria-metrics-data", "Destination path where backup must be restored. "+
 		"VictoriaMetrics must be stopped when restoring from backup. -storageDataPath dir can be non-empty. In this case the contents of -storageDataPath dir "+
 		"is synchronized with -src contents, i.e. it works like 'rsync --delete'")
@@ -36,9 +32,6 @@ func main() {
 	envflag.Parse()
 	buildinfo.Init()
 	logger.Init()
-	pushmetrics.Init()
-
-	go httpserver.Serve(*httpListenAddr, nil)
 
 	srcFS, err := newSrcFS()
 	if err != nil {
@@ -59,20 +52,13 @@ func main() {
 	}
 	srcFS.MustStop()
 	dstFS.MustStop()
-
-	startTime := time.Now()
-	logger.Infof("gracefully shutting down http server for metrics at %q", *httpListenAddr)
-	if err := httpserver.Stop(*httpListenAddr); err != nil {
-		logger.Fatalf("cannot stop http server for metrics: %s", err)
-	}
-	logger.Infof("successfully shut down http server for metrics in %.3f seconds", time.Since(startTime).Seconds())
 }
 
 func usage() {
 	const s = `
 vmrestore restores VictoriaMetrics data from backups made by vmbackup.
 
-See the docs at https://docs.victoriametrics.com/vmrestore.html .
+See the docs at https://victoriametrics.github.io/vmrestore.html .
 `
 	flagutil.Usage(s)
 }

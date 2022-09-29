@@ -4,40 +4,34 @@ import (
 	"crypto/md5"
 	"fmt"
 	"hash/fnv"
-	"net/url"
-	"os"
+	"io/ioutil"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
-	"gopkg.in/yaml.v2"
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/envtemplate"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
+	"github.com/VictoriaMetrics/metricsql"
+	"gopkg.in/yaml.v2"
 )
 
 // Group contains list of Rules grouped into
 // entity with one name and evaluation interval
 type Group struct {
-	Type        Type `yaml:"type,omitempty"`
+	Type        datasource.Type `yaml:"type,omitempty"`
 	File        string
-	Name        string              `yaml:"name"`
-	Interval    *promutils.Duration `yaml:"interval,omitempty"`
-	Limit       int                 `yaml:"limit,omitempty"`
-	Rules       []Rule              `yaml:"rules"`
-	Concurrency int                 `yaml:"concurrency"`
-	// Labels is a set of label value pairs, that will be added to every rule.
-	// It has priority over the external labels.
-	Labels map[string]string `yaml:"labels"`
+	Name        string        `yaml:"name"`
+	Interval    time.Duration `yaml:"interval,omitempty"`
+	Rules       []Rule        `yaml:"rules"`
+	Concurrency int           `yaml:"concurrency"`
 	// Checksum stores the hash of yaml definition for this group.
 	// May be used to detect any changes like rules re-ordering etc.
 	Checksum string
-	// Optional HTTP URL parameters added to each rule request
-	Params url.Values `yaml:"params"`
-	// Headers contains optional HTTP headers added to each rule request
-	Headers []Header `yaml:"headers,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
@@ -55,7 +49,15 @@ func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	}
 	// change default value to prometheus datasource.
 	if g.Type.Get() == "" {
-		g.Type.Set(NewPrometheusType())
+		g.Type.Set(datasource.NewPrometheusType())
+	}
+	// update rules with empty type.
+	for i, r := range g.Rules {
+		if r.Type.Get() == "" {
+			r.Type.Set(g.Type)
+			r.ID = HashRule(r)
+			g.Rules[i] = r
+		}
 	}
 
 	h := md5.New()
@@ -65,9 +67,12 @@ func (g *Group) UnmarshalYAML(unmarshal func(interface{}) error) error {
 }
 
 // Validate check for internal Group or Rule configuration errors
-func (g *Group) Validate(validateTplFn ValidateTplFn, validateExpressions bool) error {
+func (g *Group) Validate(validateAnnotations, validateExpressions bool) error {
 	if g.Name == "" {
 		return fmt.Errorf("group name must be set")
+	}
+	if len(g.Rules) == 0 {
+		return fmt.Errorf("group %q can't contain no rules", g.Name)
 	}
 
 	uniqueRules := map[uint64]struct{}{}
@@ -77,7 +82,7 @@ func (g *Group) Validate(validateTplFn ValidateTplFn, validateExpressions bool) 
 			ruleName = r.Alert
 		}
 		if _, ok := uniqueRules[r.ID]; ok {
-			return fmt.Errorf("%q is a duplicate within the group %q", r.String(), g.Name)
+			return fmt.Errorf("rule %q duplicate", ruleName)
 		}
 		uniqueRules[r.ID] = struct{}{}
 		if err := r.Validate(); err != nil {
@@ -87,15 +92,18 @@ func (g *Group) Validate(validateTplFn ValidateTplFn, validateExpressions bool) 
 			// its needed only for tests.
 			// because correct types must be inherited after unmarshalling.
 			exprValidator := g.Type.ValidateExpr
+			if r.Type.Get() != "" {
+				exprValidator = r.Type.ValidateExpr
+			}
 			if err := exprValidator(r.Expr); err != nil {
 				return fmt.Errorf("invalid expression for rule %q.%q: %w", g.Name, ruleName, err)
 			}
 		}
-		if validateTplFn != nil {
-			if err := validateTplFn(r.Annotations); err != nil {
+		if validateAnnotations {
+			if err := notifier.ValidateTemplates(r.Annotations); err != nil {
 				return fmt.Errorf("invalid annotations for rule %q.%q: %w", g.Name, ruleName, err)
 			}
-			if err := validateTplFn(r.Labels); err != nil {
+			if err := notifier.ValidateTemplates(r.Labels); err != nil {
 				return fmt.Errorf("invalid labels for rule %q.%q: %w", g.Name, ruleName, err)
 			}
 		}
@@ -107,16 +115,52 @@ func (g *Group) Validate(validateTplFn ValidateTplFn, validateExpressions bool) 
 // recording rule or alerting rule.
 type Rule struct {
 	ID          uint64
-	Record      string              `yaml:"record,omitempty"`
-	Alert       string              `yaml:"alert,omitempty"`
-	Expr        string              `yaml:"expr"`
-	For         *promutils.Duration `yaml:"for,omitempty"`
-	Labels      map[string]string   `yaml:"labels,omitempty"`
-	Annotations map[string]string   `yaml:"annotations,omitempty"`
-	Debug       bool                `yaml:"debug,omitempty"`
+	Type        datasource.Type   `yaml:"type,omitempty"`
+	Record      string            `yaml:"record,omitempty"`
+	Alert       string            `yaml:"alert,omitempty"`
+	Expr        string            `yaml:"expr"`
+	For         PromDuration      `yaml:"for"`
+	Labels      map[string]string `yaml:"labels,omitempty"`
+	Annotations map[string]string `yaml:"annotations,omitempty"`
 
 	// Catches all undefined fields and must be empty after parsing.
 	XXX map[string]interface{} `yaml:",inline"`
+}
+
+// PromDuration is Prometheus duration.
+type PromDuration struct {
+	milliseconds int64
+}
+
+// NewPromDuration returns PromDuration for given d.
+func NewPromDuration(d time.Duration) PromDuration {
+	return PromDuration{
+		milliseconds: d.Milliseconds(),
+	}
+}
+
+// MarshalYAML implements yaml.Marshaler interface.
+func (pd PromDuration) MarshalYAML() (interface{}, error) {
+	return pd.Duration().String(), nil
+}
+
+// UnmarshalYAML implements yaml.Unmarshaler interface.
+func (pd *PromDuration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	ms, err := metricsql.DurationValue(s, 0)
+	if err != nil {
+		return err
+	}
+	pd.milliseconds = ms
+	return nil
+}
+
+// Duration returns duration for pd.
+func (pd *PromDuration) Duration() time.Duration {
+	return time.Duration(pd.milliseconds) * time.Millisecond
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -137,32 +181,6 @@ func (r *Rule) Name() string {
 	return r.Alert
 }
 
-// String implements Stringer interface
-func (r *Rule) String() string {
-	ruleType := "recording"
-	if r.Alert != "" {
-		ruleType = "alerting"
-	}
-	b := strings.Builder{}
-	b.WriteString(fmt.Sprintf("%s rule %q", ruleType, r.Name()))
-	b.WriteString(fmt.Sprintf("; expr: %q", r.Expr))
-
-	kv := sortMap(r.Labels)
-	for i := range kv {
-		if i == 0 {
-			b.WriteString("; labels:")
-		}
-		b.WriteString(" ")
-		b.WriteString(kv[i].key)
-		b.WriteString("=")
-		b.WriteString(kv[i].value)
-		if i < len(kv)-1 {
-			b.WriteString(",")
-		}
-	}
-	return b.String()
-}
-
 // HashRule hashes significant Rule fields into
 // unique hash that supposed to define Rule uniqueness
 func HashRule(r Rule) uint64 {
@@ -175,6 +193,7 @@ func HashRule(r Rule) uint64 {
 		h.Write([]byte("alerting"))
 		h.Write([]byte(r.Alert))
 	}
+	h.Write([]byte(r.Type.Get()))
 	kv := sortMap(r.Labels)
 	for _, i := range kv {
 		h.Write([]byte(i.key))
@@ -195,11 +214,8 @@ func (r *Rule) Validate() error {
 	return checkOverflow(r.XXX, "rule")
 }
 
-// ValidateTplFn must validate the given annotations
-type ValidateTplFn func(annotations map[string]string) error
-
 // Parse parses rule configs from given file patterns
-func Parse(pathPatterns []string, validateTplFn ValidateTplFn, validateExpressions bool) ([]Group, error) {
+func Parse(pathPatterns []string, validateAnnotations, validateExpressions bool) ([]Group, error) {
 	var fp []string
 	for _, pattern := range pathPatterns {
 		matches, err := filepath.Glob(pattern)
@@ -218,7 +234,7 @@ func Parse(pathPatterns []string, validateTplFn ValidateTplFn, validateExpressio
 			continue
 		}
 		for _, g := range gr {
-			if err := g.Validate(validateTplFn, validateExpressions); err != nil {
+			if err := g.Validate(validateAnnotations, validateExpressions); err != nil {
 				errGroup.Add(fmt.Errorf("invalid group %q in file %q: %w", g.Name, file, err))
 				continue
 			}
@@ -241,7 +257,7 @@ func Parse(pathPatterns []string, validateTplFn ValidateTplFn, validateExpressio
 }
 
 func parseFile(path string) ([]Group, error) {
-	data, err := os.ReadFile(path)
+	data, err := ioutil.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("error reading alert rule file: %w", err)
 	}

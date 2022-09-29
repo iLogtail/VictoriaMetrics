@@ -12,16 +12,9 @@ func TestRoundToDecimalDigits(t *testing.T) {
 		t.Helper()
 		result := RoundToDecimalDigits(f, digits)
 		if math.IsNaN(result) {
-			if IsStaleNaN(resultExpected) {
-				if !IsStaleNaN(result) {
-					t.Fatalf("unexpected stale mark value; got %016X; want %016X", math.Float64bits(result), staleNaNBits)
-				}
-				return
-			}
 			if !math.IsNaN(resultExpected) {
 				t.Fatalf("unexpected result; got %v; want %v", result, resultExpected)
 			}
-			return
 		}
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got %v; want %v", result, resultExpected)
@@ -36,27 +29,16 @@ func TestRoundToDecimalDigits(t *testing.T) {
 	f(1234, 0, 1234)
 	f(1234.6, 0, 1235)
 	f(123.4e-99, 99, 123e-99)
-	f(nan, 10, nan)
-	f(StaleNaN, 10, StaleNaN)
 }
-
-var nan = math.NaN()
 
 func TestRoundToSignificantFigures(t *testing.T) {
 	f := func(f float64, digits int, resultExpected float64) {
 		t.Helper()
 		result := RoundToSignificantFigures(f, digits)
 		if math.IsNaN(result) {
-			if IsStaleNaN(resultExpected) {
-				if !IsStaleNaN(result) {
-					t.Fatalf("unexpected stale mark value; got %016X; want %016X", math.Float64bits(result), staleNaNBits)
-				}
-				return
-			}
 			if !math.IsNaN(resultExpected) {
 				t.Fatalf("unexpected result; got %v; want %v", result, resultExpected)
 			}
-			return
 		}
 		if result != resultExpected {
 			t.Fatalf("unexpected result; got %v; want %v", result, resultExpected)
@@ -70,8 +52,6 @@ func TestRoundToSignificantFigures(t *testing.T) {
 	f(-0.56, 1, -0.6)
 	f(1234567, 3, 1230000)
 	f(-1.234567, 4, -1.235)
-	f(nan, 10, nan)
-	f(StaleNaN, 10, StaleNaN)
 }
 
 func TestPositiveFloatToDecimal(t *testing.T) {
@@ -99,9 +79,7 @@ func TestPositiveFloatToDecimal(t *testing.T) {
 	f(1<<55, 3602879701896396, 1)
 	f(1<<62, 4611686018427387, 3)
 	f(1<<63, 9223372036854775, 3)
-	// Skip this test, since M1 returns 18446744073709551 instead of 18446744073709548
-	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1653
-	// f(1<<64, 18446744073709548, 3)
+	f(1<<64, 18446744073709548, 3)
 	f(1<<65, 368934881474191, 5)
 	f(1<<66, 737869762948382, 5)
 	f(1<<67, 1475739525896764, 5)
@@ -149,47 +127,28 @@ func TestAppendDecimalToFloat(t *testing.T) {
 	testAppendDecimalToFloat(t, []int64{874957, 1130435}, -11, []float64{8.74957e-6, 1.130435e-5})
 	testAppendDecimalToFloat(t, []int64{874957, 1130435}, -12, []float64{8.74957e-7, 1.130435e-6})
 	testAppendDecimalToFloat(t, []int64{874957, 1130435}, -13, []float64{8.74957e-8, 1.130435e-7})
-	testAppendDecimalToFloat(t, []int64{vMax, vMin, 1, 2}, 4, []float64{vMax * 1e4, vMin * 1e4, 1e4, 2e4})
-	testAppendDecimalToFloat(t, []int64{vMax, vMin, 1, 2}, -4, []float64{vMax * 1e-4, vMin * 1e-4, 1e-4, 2e-4})
 	testAppendDecimalToFloat(t, []int64{vInfPos, vInfNeg, 1, 2}, 0, []float64{infPos, infNeg, 1, 2})
 	testAppendDecimalToFloat(t, []int64{vInfPos, vInfNeg, 1, 2}, 4, []float64{infPos, infNeg, 1e4, 2e4})
 	testAppendDecimalToFloat(t, []int64{vInfPos, vInfNeg, 1, 2}, -4, []float64{infPos, infNeg, 1e-4, 2e-4})
-	testAppendDecimalToFloat(t, []int64{1234, vStaleNaN, 1, 2}, 0, []float64{1234, StaleNaN, 1, 2})
-	testAppendDecimalToFloat(t, []int64{vInfPos, vStaleNaN, vMin, 2}, 4, []float64{infPos, StaleNaN, vMin * 1e4, 2e4})
-	testAppendDecimalToFloat(t, []int64{vInfPos, vStaleNaN, vMin, 2}, -4, []float64{infPos, StaleNaN, vMin * 1e-4, 2e-4})
 }
 
 func testAppendDecimalToFloat(t *testing.T, va []int64, e int16, fExpected []float64) {
-	t.Helper()
 	f := AppendDecimalToFloat(nil, va, e)
-	if !equalValues(f, fExpected) {
+	if !reflect.DeepEqual(f, fExpected) {
 		t.Fatalf("unexpected f for va=%d, e=%d: got\n%v; expecting\n%v", va, e, f, fExpected)
 	}
 
 	prefix := []float64{1, 2, 3, 4}
 	f = AppendDecimalToFloat(prefix, va, e)
-	if !equalValues(f[:len(prefix)], prefix) {
+	if !reflect.DeepEqual(f[:len(prefix)], prefix) {
 		t.Fatalf("unexpected prefix for va=%d, e=%d; got\n%v; expecting\n%v", va, e, f[:len(prefix)], prefix)
 	}
 	if fExpected == nil {
 		fExpected = []float64{}
 	}
-	if !equalValues(f[len(prefix):], fExpected) {
+	if !reflect.DeepEqual(f[len(prefix):], fExpected) {
 		t.Fatalf("unexpected prefixed f for va=%d, e=%d: got\n%v; expecting\n%v", va, e, f[len(prefix):], fExpected)
 	}
-}
-
-func equalValues(a, b []float64) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, va := range a {
-		vb := b[i]
-		if math.Float64bits(va) != math.Float64bits(vb) {
-			return false
-		}
-	}
-	return true
 }
 
 func TestCalibrateScale(t *testing.T) {
@@ -218,7 +177,6 @@ func TestCalibrateScale(t *testing.T) {
 	testCalibrateScale(t, []int64{vMax, vMin, 123}, []int64{100}, 0, 3, []int64{vMax, vMin, 123}, []int64{100e3}, 0)
 	testCalibrateScale(t, []int64{vMax, vMin, 123}, []int64{100}, 3, 0, []int64{vMax, vMin, 123}, []int64{0}, 3)
 	testCalibrateScale(t, []int64{vMax, vMin, 123}, []int64{100}, 0, 30, []int64{92233, -92233, 0}, []int64{100e16}, 14)
-	testCalibrateScale(t, []int64{vStaleNaN, vMin, 123}, []int64{100}, 0, 30, []int64{vStaleNaN, -92233, 0}, []int64{100e16}, 14)
 
 	// See https://github.com/VictoriaMetrics/VictoriaMetrics/issues/805
 	testCalibrateScale(t, []int64{123}, []int64{vInfPos}, 0, 0, []int64{123}, []int64{vInfPos}, 0)
@@ -284,7 +242,6 @@ func TestMaxUpExponent(t *testing.T) {
 
 	f(vInfPos, 1024)
 	f(vInfNeg, 1024)
-	f(vStaleNaN, 1024)
 	f(vMin, 0)
 	f(vMax, 0)
 	f(0, 1024)
@@ -371,7 +328,6 @@ func TestAppendFloatToDecimal(t *testing.T) {
 	testAppendFloatToDecimal(t, []float64{0}, []int64{0}, 0)
 	testAppendFloatToDecimal(t, []float64{infPos, infNeg, 123}, []int64{vInfPos, vInfNeg, 123}, 0)
 	testAppendFloatToDecimal(t, []float64{infPos, infNeg, 123, 1e-4, 1e32}, []int64{vInfPos, vInfNeg, 0, 0, 1000000000000000000}, 14)
-	testAppendFloatToDecimal(t, []float64{StaleNaN, infNeg, 123, 1e-4, 1e32}, []int64{vStaleNaN, vInfNeg, 0, 0, 1000000000000000000}, 14)
 	testAppendFloatToDecimal(t, []float64{0, -0, 1, -1, 12345678, -123456789}, []int64{0, 0, 1, -1, 12345678, -123456789}, 0)
 
 	// upExp
@@ -452,7 +408,6 @@ func TestFloatToDecimal(t *testing.T) {
 
 	f(math.Inf(1), vInfPos, 0)
 	f(math.Inf(-1), vInfNeg, 0)
-	f(StaleNaN, vStaleNaN, 0)
 	f(vInfPos, 9223372036854775, 3)
 	f(vInfNeg, -9223372036854775, 3)
 	f(vMax, 9223372036854775, 3)
@@ -504,7 +459,6 @@ func TestFloatToDecimalRoundtrip(t *testing.T) {
 	f(infNeg)
 	f(vMax)
 	f(vMin)
-	f(vStaleNaN)
 
 	for i := 0; i < 1e4; i++ {
 		v := rand.NormFloat64()

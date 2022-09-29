@@ -93,7 +93,6 @@ type Instance struct {
 
 // NetworkInterface is network interface from https://cloud.google.com/compute/docs/reference/rest/v1/instances/list
 type NetworkInterface struct {
-	Name          string
 	Network       string
 	Subnetwork    string
 	NetworkIP     string
@@ -149,19 +148,18 @@ func (inst *Instance) appendTargetLabels(ms []map[string]string, project, tagSep
 		"__meta_gce_subnetwork":      iface.Subnetwork,
 		"__meta_gce_zone":            inst.Zone,
 	}
-	for _, iface := range inst.NetworkInterfaces {
-		m[discoveryutils.SanitizeLabelName("__meta_gce_interface_ipv4_"+iface.Name)] = iface.NetworkIP
-	}
 	if len(inst.Tags.Items) > 0 {
 		// We surround the separated list with the separator as well. This way regular expressions
 		// in relabeling rules don't have to consider tag positions.
 		m["__meta_gce_tags"] = tagSeparator + strings.Join(inst.Tags.Items, tagSeparator) + tagSeparator
 	}
 	for _, item := range inst.Metadata.Items {
-		m[discoveryutils.SanitizeLabelName("__meta_gce_metadata_"+item.Key)] = item.Value
+		key := discoveryutils.SanitizeLabelName(item.Key)
+		m["__meta_gce_metadata_"+key] = item.Value
 	}
 	for _, label := range inst.Labels {
-		m[discoveryutils.SanitizeLabelName("__meta_gce_label_"+label.Name)] = label.Value
+		name := discoveryutils.SanitizeLabelName(label.Name)
+		m["__meta_gce_label_"+name] = label.Value
 	}
 	if len(iface.AccessConfigs) > 0 {
 		ac := iface.AccessConfigs[0]

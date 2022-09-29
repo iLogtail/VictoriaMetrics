@@ -7,22 +7,21 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/datasource"
+
 	"gopkg.in/yaml.v2"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/notifier"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutils"
 )
 
 func TestMain(m *testing.M) {
-	if err := templates.Load([]string{"testdata/templates/*good.tmpl"}, true); err != nil {
-		os.Exit(1)
-	}
+	u, _ := url.Parse("https://victoriametrics.com/path")
+	notifier.InitTemplateFunc(u)
 	os.Exit(m.Run())
 }
 
 func TestParseGood(t *testing.T) {
-	if _, err := Parse([]string{"testdata/rules/*good.rules", "testdata/dir/*good.*"}, notifier.ValidateTemplates, true); err != nil {
+	if _, err := Parse([]string{"testdata/*good.rules", "testdata/dir/*good.*"}, true, true); err != nil {
 		t.Errorf("error parsing files %s", err)
 	}
 }
@@ -33,7 +32,7 @@ func TestParseBad(t *testing.T) {
 		expErr string
 	}{
 		{
-			[]string{"testdata/rules/rules0-bad.rules"},
+			[]string{"testdata/rules0-bad.rules"},
 			"unexpected token",
 		},
 		{
@@ -57,16 +56,12 @@ func TestParseBad(t *testing.T) {
 			"either `record` or `alert` must be set",
 		},
 		{
-			[]string{"testdata/rules/rules1-bad.rules"},
+			[]string{"testdata/rules1-bad.rules"},
 			"bad graphite expr",
-		},
-		{
-			[]string{"testdata/dir/rules6-bad.rules"},
-			"missing ':' in header",
 		},
 	}
 	for _, tc := range testCases {
-		_, err := Parse(tc.path, notifier.ValidateTemplates, true)
+		_, err := Parse(tc.path, true, true)
 		if err == nil {
 			t.Errorf("expected to get error")
 			return
@@ -100,6 +95,10 @@ func TestGroup_Validate(t *testing.T) {
 		{
 			group:  &Group{},
 			expErr: "group name must be set",
+		},
+		{
+			group:  &Group{Name: "test"},
+			expErr: "contain no rules",
 		},
 		{
 			group: &Group{Name: "test",
@@ -224,7 +223,7 @@ func TestGroup_Validate(t *testing.T) {
 		},
 		{
 			group: &Group{Name: "test thanos",
-				Type: NewRawType("thanos"),
+				Type: datasource.NewRawType("thanos"),
 				Rules: []Rule{
 					{Alert: "alert", Expr: "up == 1", Labels: map[string]string{
 						"description": "{{ value|query }}",
@@ -236,7 +235,7 @@ func TestGroup_Validate(t *testing.T) {
 		},
 		{
 			group: &Group{Name: "test graphite",
-				Type: NewGraphiteType(),
+				Type: datasource.NewGraphiteType(),
 				Rules: []Rule{
 					{Alert: "alert", Expr: "up == 1", Labels: map[string]string{
 						"description": "some-description",
@@ -248,7 +247,7 @@ func TestGroup_Validate(t *testing.T) {
 		},
 		{
 			group: &Group{Name: "test prometheus",
-				Type: NewPrometheusType(),
+				Type: datasource.NewPrometheusType(),
 				Rules: []Rule{
 					{Alert: "alert", Expr: "up == 1", Labels: map[string]string{
 						"description": "{{ value|query }}",
@@ -261,14 +260,15 @@ func TestGroup_Validate(t *testing.T) {
 		{
 			group: &Group{
 				Name: "test graphite inherit",
-				Type: NewGraphiteType(),
+				Type: datasource.NewGraphiteType(),
 				Rules: []Rule{
 					{
 						Expr: "sumSeries(time('foo.bar',10))",
-						For:  promutils.NewDuration(10 * time.Millisecond),
+						For:  PromDuration{milliseconds: 10},
 					},
 					{
 						Expr: "sum(up == 0 ) by (host)",
+						Type: datasource.NewPrometheusType(),
 					},
 				},
 			},
@@ -276,27 +276,23 @@ func TestGroup_Validate(t *testing.T) {
 		{
 			group: &Group{
 				Name: "test graphite prometheus bad expr",
-				Type: NewGraphiteType(),
+				Type: datasource.NewGraphiteType(),
 				Rules: []Rule{
 					{
 						Expr: "sum(up == 0 ) by (host)",
-						For:  promutils.NewDuration(10 * time.Millisecond),
+						For:  PromDuration{milliseconds: 10},
 					},
 					{
 						Expr: "sumSeries(time('foo.bar',10))",
+						Type: datasource.NewPrometheusType(),
 					},
 				},
 			},
 			expErr: "invalid rule",
 		},
 	}
-
 	for _, tc := range testCases {
-		var validateTplFn ValidateTplFn
-		if tc.validateAnnotations {
-			validateTplFn = notifier.ValidateTemplates
-		}
-		err := tc.group.Validate(validateTplFn, tc.validateExpressions)
+		err := tc.group.Validate(tc.validateAnnotations, tc.validateExpressions)
 		if err == nil {
 			if tc.expErr != "" {
 				t.Errorf("expected to get err %q; got nil insted", tc.expErr)
@@ -352,7 +348,7 @@ func TestHashRule(t *testing.T) {
 			true,
 		},
 		{
-			Rule{Alert: "alert", Expr: "up == 1", For: promutils.NewDuration(time.Minute)},
+			Rule{Alert: "alert", Expr: "up == 1", For: NewPromDuration(time.Minute)},
 			Rule{Alert: "alert", Expr: "up == 1"},
 			true,
 		},
@@ -441,7 +437,7 @@ rules:
 `)
 	})
 
-	t.Run("`for` change", func(t *testing.T) {
+	t.Run("Ok, `for` must change cs", func(t *testing.T) {
 		f(t, `
 name: TestGroup
 rules:
@@ -455,136 +451,5 @@ rules:
     expr: sum by(job) (up == 1)
 `)
 	})
-	t.Run("`interval` change", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-interval: 2s
-rules:
-  - alert: ExampleAlertWithFor
-    expr: sum by(job) (up == 1)
-`, `
-name: TestGroup
-interval: 4s
-rules:
-  - alert: ExampleAlertWithFor
-    expr: sum by(job) (up == 1)
-`)
-	})
-	t.Run("`concurrency` change", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-concurrency: 2
-rules:
-  - alert: ExampleAlertWithFor
-    expr: sum by(job) (up == 1)
-`, `
-name: TestGroup
-concurrency: 16
-rules:
-  - alert: ExampleAlertWithFor
-    expr: sum by(job) (up == 1)
-`)
-	})
 
-	t.Run("`params` change", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-params:
-    nocache: ["1"]
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`, `
-name: TestGroup
-params:
-    nocache: ["0"]
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`)
-	})
-
-	t.Run("`limit` change", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-limit: 5
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`, `
-name: TestGroup
-limit: 10
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`)
-	})
-
-	t.Run("`headers` change", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-headers:
-  - "TenantID: foo"
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`, `
-name: TestGroup
-headers:
-  - "TenantID: bar"
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`)
-	})
-
-	t.Run("`debug` change", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-`, `
-name: TestGroup
-rules:
-  - alert: foo
-    expr: sum by(job) (up == 1)
-    debug: true
-`)
-	})
-}
-
-func TestGroupParams(t *testing.T) {
-	f := func(t *testing.T, data string, expParams url.Values) {
-		t.Helper()
-		var g Group
-		if err := yaml.Unmarshal([]byte(data), &g); err != nil {
-			t.Fatalf("failed to unmarshal: %s", err)
-		}
-		got, exp := g.Params.Encode(), expParams.Encode()
-		if got != exp {
-			t.Fatalf("expected to have %q; got %q", exp, got)
-		}
-	}
-
-	t.Run("no params", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-rules:
-  - alert: ExampleAlertAlwaysFiring
-    expr: sum by(job) (up == 1)
-`, url.Values{})
-	})
-
-	t.Run("params", func(t *testing.T) {
-		f(t, `
-name: TestGroup
-params:
-  nocache: ["1"]
-  denyPartialResponse: ["true"]
-rules:
-  - alert: ExampleAlertAlwaysFiring
-    expr: sum by(job) (up == 1)
-`, url.Values{"nocache": {"1"}, "denyPartialResponse": {"true"}})
-	})
 }

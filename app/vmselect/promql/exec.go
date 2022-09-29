@@ -13,39 +13,34 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/netstorage"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmselect/querystats"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/querytracer"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
 )
 
 var (
+	logSlowQueryDuration   = flag.Duration("search.logSlowQueryDuration", 5*time.Second, "Log queries with execution time exceeding this value. Zero disables slow query logging")
 	treatDotsAsIsInRegexps = flag.Bool("search.treatDotsAsIsInRegexps", false, "Whether to treat dots as is in regexp label filters used in queries. "+
 		`For example, foo{bar=~"a.b.c"} will be automatically converted to foo{bar=~"a\\.b\\.c"}, i.e. all the dots in regexp filters will be automatically escaped `+
 		`in order to match only dot char instead of matching any char. Dots in ".+", ".*" and ".{n}" regexps aren't escaped. `+
 		`This option is DEPRECATED in favor of {__graphite__="a.*.c"} syntax for selecting metrics matching the given Graphite metrics filter`)
 )
 
-// UserReadableError is a type of error which supposed to be returned to the user without additional context.
-type UserReadableError struct {
-	// Err is the error which needs to be returned to the user.
-	Err error
-}
-
-// Unwrap returns ure.Err.
-//
-// This is used by standard errors package. See https://golang.org/pkg/errors
-func (ure *UserReadableError) Unwrap() error {
-	return ure.Err
-}
-
-// Error satisfies Error interface
-func (ure *UserReadableError) Error() string {
-	return ure.Err.Error()
-}
+var slowQueries = metrics.NewCounter(`vm_slow_queries_total`)
 
 // Exec executes q for the given ec.
-func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
+func Exec(ec *EvalConfig, q string, isFirstPointOnly bool) ([]netstorage.Result, error) {
+	if *logSlowQueryDuration > 0 {
+		startTime := time.Now()
+		defer func() {
+			d := time.Since(startTime)
+			if d >= *logSlowQueryDuration {
+				logger.Warnf("slow query according to -search.logSlowQueryDuration=%s: remoteAddr=%s, duration=%.3f seconds, start=%d, end=%d, step=%d, query=%q",
+					*logSlowQueryDuration, ec.QuotedRemoteAddr, d.Seconds(), ec.Start/1000, ec.End/1000, ec.Step/1000, q)
+				slowQueries.Inc()
+			}
+		}()
+	}
 	if querystats.Enabled() {
 		startTime := time.Now()
 		defer querystats.RegisterQuery(q, ec.End-ec.Start, startTime)
@@ -59,28 +54,24 @@ func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly boo
 	}
 
 	qid := activeQueriesV.Add(ec, q)
-	rv, err := evalExpr(qt, ec, e)
+	rv, err := evalExpr(ec, e)
 	activeQueriesV.Remove(qid)
 	if err != nil {
 		return nil, err
 	}
+
 	if isFirstPointOnly {
 		// Remove all the points except the first one from every time series.
 		for _, ts := range rv {
 			ts.Values = ts.Values[:1]
 			ts.Timestamps = ts.Timestamps[:1]
 		}
-		qt.Printf("leave only the first point in every series")
 	}
+
 	maySort := maySortResults(e, rv)
 	result, err := timeseriesToResult(rv, maySort)
 	if err != nil {
 		return nil, err
-	}
-	if maySort {
-		qt.Printf("sort series by metric name and labels")
-	} else {
-		qt.Printf("do not sort series by metric name and labels")
 	}
 	if n := ec.RoundDigits; n < 100 {
 		for i := range result {
@@ -89,9 +80,8 @@ func Exec(qt *querytracer.Tracer, ec *EvalConfig, q string, isFirstPointOnly boo
 				values[j] = decimal.RoundToDecimalDigits(v, n)
 			}
 		}
-		qt.Printf("round series values to %d decimal digits after the point", n)
 	}
-	return result, nil
+	return result, err
 }
 
 func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
@@ -99,15 +89,14 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 	case *metricsql.FuncExpr:
 		switch strings.ToLower(v.Name) {
 		case "sort", "sort_desc",
-			"sort_by_label", "sort_by_label_desc",
-			"sort_by_label_numeric", "sort_by_label_numeric_desc":
+			"sort_by_label", "sort_by_label_desc":
 			return false
 		}
 	case *metricsql.AggrFuncExpr:
 		switch strings.ToLower(v.Name) {
 		case "topk", "bottomk", "outliersk",
-			"topk_max", "topk_min", "topk_avg", "topk_median", "topk_last",
-			"bottomk_max", "bottomk_min", "bottomk_avg", "bottomk_median", "bottomk_last":
+			"topk_max", "topk_min", "topk_avg", "topk_median",
+			"bottomk_max", "bottomk_min", "bottomk_avg", "bottomk_median":
 			return false
 		}
 	}
@@ -115,7 +104,7 @@ func maySortResults(e metricsql.Expr, tss []*timeseries) bool {
 }
 
 func timeseriesToResult(tss []*timeseries, maySort bool) ([]netstorage.Result, error) {
-	tss = removeEmptySeries(tss)
+	tss = removeNaNs(tss)
 	result := make([]netstorage.Result, len(tss))
 	m := make(map[string]struct{}, len(tss))
 	bb := bbPool.Get()
@@ -127,6 +116,7 @@ func timeseriesToResult(tss []*timeseries, maySort bool) ([]netstorage.Result, e
 		m[string(bb.B)] = struct{}{}
 
 		rs := &result[i]
+		rs.MetricNameMarshaled = append(rs.MetricNameMarshaled[:0], bb.B...)
 		rs.MetricName.CopyFrom(&ts.MetricName)
 		rs.Values = append(rs.Values[:0], ts.Values...)
 		rs.Timestamps = append(rs.Timestamps[:0], ts.Timestamps...)
@@ -135,40 +125,14 @@ func timeseriesToResult(tss []*timeseries, maySort bool) ([]netstorage.Result, e
 
 	if maySort {
 		sort.Slice(result, func(i, j int) bool {
-			return metricNameLess(&result[i].MetricName, &result[j].MetricName)
+			return string(result[i].MetricNameMarshaled) < string(result[j].MetricNameMarshaled)
 		})
 	}
 
 	return result, nil
 }
 
-func metricNameLess(a, b *storage.MetricName) bool {
-	if string(a.MetricGroup) != string(b.MetricGroup) {
-		return string(a.MetricGroup) < string(b.MetricGroup)
-	}
-	// Metric names for a and b match. Compare tags.
-	// Tags must be already sorted by the caller, so just compare them.
-	ats := a.Tags
-	bts := b.Tags
-	for i := range ats {
-		if i >= len(bts) {
-			// a contains more tags than b and all the previous tags were identical,
-			// so a is considered bigger than b.
-			return false
-		}
-		at := &ats[i]
-		bt := &bts[i]
-		if string(at.Key) != string(bt.Key) {
-			return string(at.Key) < string(bt.Key)
-		}
-		if string(at.Value) != string(bt.Value) {
-			return string(at.Value) < string(bt.Value)
-		}
-	}
-	return len(ats) < len(bts)
-}
-
-func removeEmptySeries(tss []*timeseries) []*timeseries {
+func removeNaNs(tss []*timeseries) []*timeseries {
 	rvs := tss[:0]
 	for _, ts := range tss {
 		allNans := true

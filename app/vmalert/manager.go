@@ -3,8 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"net/url"
-	"sort"
+	"strings"
 	"sync"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/config"
@@ -16,35 +15,17 @@ import (
 
 // manager controls group states
 type manager struct {
-	querierBuilder datasource.QuerierBuilder
-	notifiers      func() []notifier.Notifier
+	querier   datasource.Querier
+	notifiers []notifier.Notifier
 
 	rw *remotewrite.Client
-	// remote read builder.
-	rr datasource.QuerierBuilder
+	rr datasource.Querier
 
 	wg     sync.WaitGroup
 	labels map[string]string
 
 	groupsMu sync.RWMutex
 	groups   map[uint64]*Group
-}
-
-// RuleAPI generates APIRule object from alert by its ID(hash)
-func (m *manager) RuleAPI(gID, rID uint64) (APIRule, error) {
-	m.groupsMu.RLock()
-	defer m.groupsMu.RUnlock()
-
-	g, ok := m.groups[gID]
-	if !ok {
-		return APIRule{}, fmt.Errorf("can't find group with id %d", gID)
-	}
-	for _, rule := range g.Rules {
-		if rule.ID() == rID {
-			return rule.ToAPI(), nil
-		}
-	}
-	return APIRule{}, fmt.Errorf("can't find rule with id %d in group %q", rID, g.Name)
 }
 
 // AlertAPI generates APIAlert object from alert by its ID(hash)
@@ -54,7 +35,7 @@ func (m *manager) AlertAPI(gID, aID uint64) (*APIAlert, error) {
 
 	g, ok := m.groups[gID]
 	if !ok {
-		return nil, fmt.Errorf("can't find group with id %d", gID)
+		return nil, fmt.Errorf("can't find group with id %q", gID)
 	}
 	for _, rule := range g.Rules {
 		ar, ok := rule.(*AlertingRule)
@@ -65,11 +46,11 @@ func (m *manager) AlertAPI(gID, aID uint64) (*APIAlert, error) {
 			return apiAlert, nil
 		}
 	}
-	return nil, fmt.Errorf("can't find alert with id %d in group %q", aID, g.Name)
+	return nil, fmt.Errorf("can't find alert with id %q in group %q", aID, g.Name)
 }
 
-func (m *manager) start(ctx context.Context, groupsCfg []config.Group) error {
-	return m.update(ctx, groupsCfg, true)
+func (m *manager) start(ctx context.Context, path []string, validateTpl, validateExpr bool) error {
+	return m.update(ctx, path, validateTpl, validateExpr, true)
 }
 
 func (m *manager) close() {
@@ -82,51 +63,34 @@ func (m *manager) close() {
 	m.wg.Wait()
 }
 
-func (m *manager) startGroup(ctx context.Context, group *Group, restore bool) error {
+func (m *manager) startGroup(ctx context.Context, group *Group, restore bool) {
 	if restore && m.rr != nil {
 		err := group.Restore(ctx, m.rr, *remoteReadLookBack, m.labels)
 		if err != nil {
-			if !*remoteReadIgnoreRestoreErrors {
-				return fmt.Errorf("failed to restore ruleState for group %q: %w", group.Name, err)
-			}
-			logger.Errorf("error while restoring ruleState for group %q: %s", group.Name, err)
+			logger.Errorf("error while restoring state for group %q: %s", group.Name, err)
 		}
 	}
 
 	m.wg.Add(1)
 	id := group.ID()
 	go func() {
-		group.start(ctx, m.notifiers, m.rw)
+		group.start(ctx, m.querier, m.notifiers, m.rw)
 		m.wg.Done()
 	}()
 	m.groups[id] = group
-	return nil
 }
 
-func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore bool) error {
-	var rrPresent, arPresent bool
-	groupsRegistry := make(map[uint64]*Group)
-	for _, cfg := range groupsCfg {
-		for _, r := range cfg.Rules {
-			if rrPresent && arPresent {
-				continue
-			}
-			if r.Record != "" {
-				rrPresent = true
-			}
-			if r.Alert != "" {
-				arPresent = true
-			}
-		}
-		ng := newGroup(cfg, m.querierBuilder, *evaluationInterval, m.labels)
-		groupsRegistry[ng.ID()] = ng
+func (m *manager) update(ctx context.Context, path []string, validateTpl, validateExpr, restore bool) error {
+	logger.Infof("reading rules configuration file from %q", strings.Join(path, ";"))
+	groupsCfg, err := config.Parse(path, validateTpl, validateExpr)
+	if err != nil {
+		return fmt.Errorf("cannot parse configuration file: %w", err)
 	}
 
-	if rrPresent && m.rw == nil {
-		return fmt.Errorf("config contains recording rules but `-remoteWrite.url` isn't set")
-	}
-	if arPresent && m.notifiers == nil {
-		return fmt.Errorf("config contains alerting rules but neither `-notifier.url` nor `-notifier.config` aren't set")
+	groupsRegistry := make(map[uint64]*Group)
+	for _, cfg := range groupsCfg {
+		ng := newGroup(cfg, *evaluationInterval, m.labels)
+		groupsRegistry[ng.ID()] = ng
 	}
 
 	type updateItem struct {
@@ -152,9 +116,7 @@ func (m *manager) update(ctx context.Context, groupsCfg []config.Group, restore 
 		}
 	}
 	for _, ng := range groupsRegistry {
-		if err := m.startGroup(ctx, ng, restore); err != nil {
-			return err
-		}
+		m.startGroup(ctx, ng, restore)
 	}
 	m.groupsMu.Unlock()
 
@@ -178,61 +140,20 @@ func (g *Group) toAPI() APIGroup {
 
 	ag := APIGroup{
 		// encode as string to avoid rounding
-		ID: fmt.Sprintf("%d", g.ID()),
-
-		Name:           g.Name,
-		Type:           g.Type.String(),
-		File:           g.File,
-		Interval:       g.Interval.Seconds(),
-		LastEvaluation: g.LastEvaluation,
-		Concurrency:    g.Concurrency,
-		Params:         urlValuesToStrings(g.Params),
-		Headers:        headersToStrings(g.Headers),
-		Labels:         g.Labels,
+		ID:          fmt.Sprintf("%d", g.ID()),
+		Name:        g.Name,
+		Type:        g.Type.String(),
+		File:        g.File,
+		Interval:    g.Interval.String(),
+		Concurrency: g.Concurrency,
 	}
 	for _, r := range g.Rules {
-		ag.Rules = append(ag.Rules, r.ToAPI())
-	}
-	return ag
-}
-
-func urlValuesToStrings(values url.Values) []string {
-	if len(values) < 1 {
-		return nil
-	}
-
-	keys := make([]string, 0, len(values))
-	for k := range values {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var res []string
-	for _, k := range keys {
-		params := values[k]
-		for _, v := range params {
-			res = append(res, fmt.Sprintf("%s=%s", k, v))
+		switch v := r.(type) {
+		case *AlertingRule:
+			ag.AlertingRules = append(ag.AlertingRules, v.RuleAPI())
+		case *RecordingRule:
+			ag.RecordingRules = append(ag.RecordingRules, v.RuleAPI())
 		}
 	}
-	return res
-}
-
-func headersToStrings(headers map[string]string) []string {
-	if len(headers) < 1 {
-		return nil
-	}
-
-	keys := make([]string, 0, len(headers))
-	for k := range headers {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var res []string
-	for _, k := range keys {
-		v := headers[k]
-		res = append(res, fmt.Sprintf("%s: %s", k, v))
-	}
-
-	return res
+	return ag
 }

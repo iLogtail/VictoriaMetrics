@@ -17,8 +17,7 @@ func TestTableOpenClose(t *testing.T) {
 	}()
 
 	// Create a new table
-	var isReadOnly uint32
-	tb, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs, &isReadOnly)
+	tb, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs)
 	if err != nil {
 		t.Fatalf("cannot create new table: %s", err)
 	}
@@ -28,7 +27,7 @@ func TestTableOpenClose(t *testing.T) {
 
 	// Re-open created table multiple times.
 	for i := 0; i < 10; i++ {
-		tb, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs, &isReadOnly)
+		tb, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs)
 		if err != nil {
 			t.Fatalf("cannot open created table: %s", err)
 		}
@@ -44,15 +43,14 @@ func TestTableOpenMultipleTimes(t *testing.T) {
 		_ = os.RemoveAll(path)
 	}()
 
-	var isReadOnly uint32
-	tb1, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs, &isReadOnly)
+	tb1, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs)
 	if err != nil {
 		t.Fatalf("cannot open table the first time: %s", err)
 	}
 	defer tb1.MustClose()
 
 	for i := 0; i < 10; i++ {
-		tb2, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs, &isReadOnly)
+		tb2, err := openTable(path, nilGetDeletedMetricIDs, retentionMsecs)
 		if err == nil {
 			tb2.MustClose()
 			t.Fatalf("expecting non-nil error when opening already opened table")

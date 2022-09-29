@@ -1,13 +1,7 @@
 *.coverprofile
-*.exe
 *.orig
-.*envrc
-.envrc
-.idea
-/.local/
-/site/
-coverage.txt
-internal/*/built-example
+node_modules/
 vendor
-/cmd/urfave-cli-genflags/urfave-cli-genflags
-*.exe
+.idea
+internal/*/built-example
+coverage.txt

@@ -27,13 +27,13 @@ func Test_parseTasks(t *testing.T) {
     "Version": {
       "Index": 23
     },
+    "Labels": {
+	    "label1": "value1"
+    },
     "Spec": {
       "ContainerSpec": {
         "Image": "redis:3.0.6@sha256:6a692a76c2081888b589e26e6ec835743119fe453d67ecf03df7de5b73d69842",
-        "Init": false,
-        "Labels": {
-	    "label1": "value1"
-        }
+        "Init": false
       },
       "Resources": {
         "Limits": {},
@@ -70,18 +70,8 @@ func Test_parseTasks(t *testing.T) {
 					ID:        "t4rdm7j2y9yctbrksiwvsgpu5",
 					ServiceID: "t91nf284wzle1ya09lqvyjgnq",
 					NodeID:    "qauwmifceyvqs0sipvzu8oslu",
-					Spec: struct {
-						ContainerSpec struct {
-							Labels map[string]string
-						}
-					}{
-						ContainerSpec: struct {
-							Labels map[string]string
-						}{
-							Labels: map[string]string{
-								"label1": "value1",
-							},
-						},
+					Labels: map[string]string{
+						"label1": "value1",
 					},
 					DesiredState: "running",
 					Slot:         1,
@@ -107,7 +97,7 @@ func Test_parseTasks(t *testing.T) {
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("parseTasks() got\n%v\nwant\n%v", got, tt.want)
+				t.Errorf("parseTasks() got = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -136,6 +126,7 @@ func Test_addTasksLabels(t *testing.T) {
 						ID:           "t4rdm7j2y9yctbrksiwvsgpu5",
 						ServiceID:    "t91nf284wzle1ya09lqvyjgnq",
 						NodeID:       "qauwmifceyvqs0sipvzu8oslu",
+						Labels:       map[string]string{},
 						DesiredState: "running",
 						Slot:         1,
 						Status: struct {
@@ -176,7 +167,7 @@ func Test_addTasksLabels(t *testing.T) {
 			},
 			want: [][]prompbmarshal.Label{
 				discoveryutils.GetSortedLabels(map[string]string{
-					"__address__":                                   "172.31.40.97:6379",
+					"__address__":                                   "172.31.40.97:9100",
 					"__meta_dockerswarm_node_address":               "172.31.40.97",
 					"__meta_dockerswarm_node_availability":          "active",
 					"__meta_dockerswarm_node_engine_version":        "19.03.11",
@@ -203,6 +194,7 @@ func Test_addTasksLabels(t *testing.T) {
 						ID:           "t4rdm7j2y9yctbrksiwvsgpu5",
 						ServiceID:    "tgsci5gd31aai3jyudv98pqxf",
 						NodeID:       "qauwmifceyvqs0sipvzu8oslu",
+						Labels:       map[string]string{},
 						DesiredState: "running",
 						Slot:         1,
 						NetworksAttachments: []struct {
@@ -303,10 +295,9 @@ func Test_addTasksLabels(t *testing.T) {
 						}{
 							Ports: []portConfig{
 								{
-									Protocol:      "tcp",
-									Name:          "redis",
-									PublishMode:   "ingress",
-									PublishedPort: 6379,
+									Protocol:    "tcp",
+									Name:        "redis",
+									PublishMode: "ingress",
 								},
 							}, VirtualIPs: []struct {
 								NetworkID string
@@ -324,7 +315,8 @@ func Test_addTasksLabels(t *testing.T) {
 			},
 			want: [][]prompbmarshal.Label{
 				discoveryutils.GetSortedLabels(map[string]string{
-					"__address__":                                   "10.10.15.15:6379",
+					"__address":                                     "10.10.15.15:0",
+					"__address__":                                   "172.31.40.97:9100",
 					"__meta_dockerswarm_network_id":                 "qs0hog6ldlei9ct11pr3c77v1",
 					"__meta_dockerswarm_network_ingress":            "true",
 					"__meta_dockerswarm_network_internal":           "false",

@@ -2,188 +2,205 @@ package datasource
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/logger"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 )
 
-type datasourceType string
+type response struct {
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Labels map[string]string `json:"metric"`
+			TV     [2]interface{}    `json:"value"`
+		} `json:"result"`
+	} `json:"data"`
+	ErrorType string `json:"errorType"`
+	Error     string `json:"error"`
+}
 
-const (
-	datasourcePrometheus datasourceType = "prometheus"
-	datasourceGraphite   datasourceType = "graphite"
-)
-
-func toDatasourceType(s string) datasourceType {
-	if s == string(datasourceGraphite) {
-		return datasourceGraphite
+func (r response) metrics() ([]Metric, error) {
+	var ms []Metric
+	var m Metric
+	var f float64
+	var err error
+	for i, res := range r.Data.Result {
+		f, err = strconv.ParseFloat(res.TV[1].(string), 64)
+		if err != nil {
+			return nil, fmt.Errorf("metric %v, unable to parse float64 from %s: %w", res, res.TV[1], err)
+		}
+		m.Labels = nil
+		for k, v := range r.Data.Result[i].Labels {
+			m.AddLabel(k, v)
+		}
+		m.Timestamp = int64(res.TV[0].(float64))
+		m.Value = f
+		ms = append(ms, m)
 	}
-	return datasourcePrometheus
+	return ms, nil
+}
+
+type graphiteResponse []graphiteResponseTarget
+
+type graphiteResponseTarget struct {
+	Target     string            `json:"target"`
+	Tags       map[string]string `json:"tags"`
+	DataPoints [][2]float64      `json:"datapoints"`
+}
+
+func (r graphiteResponse) metrics() []Metric {
+	var ms []Metric
+	for _, res := range r {
+		if len(res.DataPoints) < 1 {
+			continue
+		}
+		var m Metric
+		// add only last value to the result.
+		last := res.DataPoints[len(res.DataPoints)-1]
+		m.Value = last[0]
+		m.Timestamp = int64(last[1])
+		for k, v := range res.Tags {
+			m.AddLabel(k, v)
+		}
+		ms = append(ms, m)
+	}
+	return ms
 }
 
 // VMStorage represents vmstorage entity with ability to read and write metrics
 type VMStorage struct {
 	c                *http.Client
-	authCfg          *promauth.Config
 	datasourceURL    string
+	basicAuthUser    string
+	basicAuthPass    string
 	appendTypePrefix bool
 	lookBack         time.Duration
 	queryStep        time.Duration
-
-	dataSourceType     datasourceType
-	evaluationInterval time.Duration
-	extraParams        url.Values
-	extraHeaders       []keyValue
-
-	// whether to print additional log messages
-	// for each sent request
-	debug bool
 }
 
-type keyValue struct {
-	key   string
-	value string
-}
+const queryPath = "/api/v1/query"
+const graphitePath = "/render"
 
-// Clone makes clone of VMStorage, shares http client.
-func (s *VMStorage) Clone() *VMStorage {
-	return &VMStorage{
-		c:                s.c,
-		authCfg:          s.authCfg,
-		datasourceURL:    s.datasourceURL,
-		lookBack:         s.lookBack,
-		queryStep:        s.queryStep,
-		appendTypePrefix: s.appendTypePrefix,
-		dataSourceType:   s.dataSourceType,
-	}
-}
-
-// ApplyParams - changes given querier params.
-func (s *VMStorage) ApplyParams(params QuerierParams) *VMStorage {
-	s.dataSourceType = toDatasourceType(params.DataSourceType)
-	s.evaluationInterval = params.EvaluationInterval
-	s.extraParams = params.QueryParams
-	s.debug = params.Debug
-	if params.Headers != nil {
-		for key, value := range params.Headers {
-			kv := keyValue{key: key, value: value}
-			s.extraHeaders = append(s.extraHeaders, kv)
-		}
-	}
-	return s
-}
-
-// BuildWithParams - implements interface.
-func (s *VMStorage) BuildWithParams(params QuerierParams) Querier {
-	return s.Clone().ApplyParams(params)
-}
+const prometheusPrefix = "/prometheus"
+const graphitePrefix = "/graphite"
 
 // NewVMStorage is a constructor for VMStorage
-func NewVMStorage(baseURL string, authCfg *promauth.Config, lookBack time.Duration, queryStep time.Duration, appendTypePrefix bool, c *http.Client) *VMStorage {
+func NewVMStorage(baseURL, basicAuthUser, basicAuthPass string, lookBack time.Duration, queryStep time.Duration, appendTypePrefix bool, c *http.Client) *VMStorage {
 	return &VMStorage{
 		c:                c,
-		authCfg:          authCfg,
+		basicAuthUser:    basicAuthUser,
+		basicAuthPass:    basicAuthPass,
 		datasourceURL:    strings.TrimSuffix(baseURL, "/"),
 		appendTypePrefix: appendTypePrefix,
 		lookBack:         lookBack,
 		queryStep:        queryStep,
-		dataSourceType:   datasourcePrometheus,
 	}
 }
 
-// Query executes the given query and returns parsed response
-func (s *VMStorage) Query(ctx context.Context, query string, ts time.Time) ([]Metric, *http.Request, error) {
-	req, err := s.newRequestPOST()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	switch s.dataSourceType {
-	case "", datasourcePrometheus:
-		s.setPrometheusInstantReqParams(req, query, ts)
-	case datasourceGraphite:
-		s.setGraphiteReqParams(req, query, ts)
+// Query reads metrics from datasource by given query and type
+func (s *VMStorage) Query(ctx context.Context, query string, dataSourceType Type) ([]Metric, error) {
+	switch dataSourceType.name {
+	case "", prometheusType:
+		return s.queryDataSource(ctx, query, s.setPrometheusReqParams, parsePrometheusResponse)
+	case graphiteType:
+		return s.queryDataSource(ctx, query, s.setGraphiteReqParams, parseGraphiteResponse)
 	default:
-		return nil, nil, fmt.Errorf("engine not found: %q", s.dataSourceType)
+		return nil, fmt.Errorf("engine not found: %q", dataSourceType)
 	}
-
-	resp, err := s.do(ctx, req)
-	if err != nil {
-		return nil, req, err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-
-	parseFn := parsePrometheusResponse
-	if s.dataSourceType != datasourcePrometheus {
-		parseFn = parseGraphiteResponse
-	}
-	result, err := parseFn(req, resp)
-	return result, req, err
 }
 
-// QueryRange executes the given query on the given time range.
-// For Prometheus type see https://prometheus.io/docs/prometheus/latest/querying/api/#range-queries
-// Graphite type isn't supported.
-func (s *VMStorage) QueryRange(ctx context.Context, query string, start, end time.Time) ([]Metric, error) {
-	if s.dataSourceType != datasourcePrometheus {
-		return nil, fmt.Errorf("%q is not supported for QueryRange", s.dataSourceType)
-	}
-	req, err := s.newRequestPOST()
-	if err != nil {
-		return nil, err
-	}
-	if start.IsZero() {
-		return nil, fmt.Errorf("start param is missing")
-	}
-	if end.IsZero() {
-		return nil, fmt.Errorf("end param is missing")
-	}
-	s.setPrometheusRangeReqParams(req, query, start, end)
-	resp, err := s.do(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
-	return parsePrometheusResponse(req, resp)
-}
-
-func (s *VMStorage) do(ctx context.Context, req *http.Request) (*http.Response, error) {
-	if s.debug {
-		logger.Infof("DEBUG datasource request: executing %s request with params %q", req.Method, req.URL.RawQuery)
-	}
-	resp, err := s.c.Do(req.WithContext(ctx))
-	if err != nil {
-		return nil, fmt.Errorf("error getting response from %s: %w", req.URL.Redacted(), err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("unexpected response code %d for %s. Response body %s", resp.StatusCode, req.URL.Redacted(), body)
-	}
-	return resp, nil
-}
-
-func (s *VMStorage) newRequestPOST() (*http.Request, error) {
+func (s *VMStorage) queryDataSource(
+	ctx context.Context,
+	query string,
+	setReqParams func(r *http.Request, query string),
+	processResponse func(r *http.Request, resp *http.Response,
+	) ([]Metric, error)) ([]Metric, error) {
 	req, err := http.NewRequest("POST", s.datasourceURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if s.authCfg != nil {
-		s.authCfg.SetHeaders(req, true)
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	if s.basicAuthPass != "" {
+		req.SetBasicAuth(s.basicAuthUser, s.basicAuthPass)
 	}
-	for _, h := range s.extraHeaders {
-		req.Header.Set(h.key, h.value)
+	setReqParams(req, query)
+	resp, err := s.c.Do(req.WithContext(ctx))
+	if err != nil {
+		return nil, fmt.Errorf("error getting response from %s: %w", req.URL, err)
 	}
-	return req, nil
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := ioutil.ReadAll(resp.Body)
+		return nil, fmt.Errorf("datasource returns unexpected response code %d for %s. Response body %s", resp.StatusCode, req.URL, body)
+	}
+	return processResponse(req, resp)
+}
+
+func (s *VMStorage) setPrometheusReqParams(r *http.Request, query string) {
+	if s.appendTypePrefix {
+		r.URL.Path += prometheusPrefix
+	}
+	r.URL.Path += queryPath
+	q := r.URL.Query()
+	q.Set("query", query)
+	if s.lookBack > 0 {
+		lookBack := time.Now().Add(-s.lookBack)
+		q.Set("time", fmt.Sprintf("%d", lookBack.Unix()))
+	}
+	if s.queryStep > 0 {
+		q.Set("step", s.queryStep.String())
+	}
+	r.URL.RawQuery = q.Encode()
+}
+
+func (s *VMStorage) setGraphiteReqParams(r *http.Request, query string) {
+	if s.appendTypePrefix {
+		r.URL.Path += graphitePrefix
+	}
+	r.URL.Path += graphitePath
+	q := r.URL.Query()
+	q.Set("format", "json")
+	q.Set("target", query)
+	from := "-5min"
+	if s.lookBack > 0 {
+		lookBack := time.Now().Add(-s.lookBack)
+		from = strconv.FormatInt(lookBack.Unix(), 10)
+	}
+	q.Set("from", from)
+	q.Set("until", "now")
+	r.URL.RawQuery = q.Encode()
+}
+
+const (
+	statusSuccess, statusError, rtVector = "success", "error", "vector"
+)
+
+func parsePrometheusResponse(req *http.Request, resp *http.Response) ([]Metric, error) {
+	r := &response{}
+	if err := json.NewDecoder(resp.Body).Decode(r); err != nil {
+		return nil, fmt.Errorf("error parsing prometheus metrics for %s: %w", req.URL, err)
+	}
+	if r.Status == statusError {
+		return nil, fmt.Errorf("response error, query: %s, errorType: %s, error: %s", req.URL, r.ErrorType, r.Error)
+	}
+	if r.Status != statusSuccess {
+		return nil, fmt.Errorf("unknown status: %s, Expected success or error ", r.Status)
+	}
+	if r.Data.ResultType != rtVector {
+		return nil, fmt.Errorf("unknown result type:%s. Expected vector", r.Data.ResultType)
+	}
+	return r.metrics()
+}
+
+func parseGraphiteResponse(req *http.Request, resp *http.Response) ([]Metric, error) {
+	r := &graphiteResponse{}
+	if err := json.NewDecoder(resp.Body).Decode(r); err != nil {
+		return nil, fmt.Errorf("error parsing graphite metrics for %s: %w", req.URL, err)
+	}
+	return r.metrics(), nil
 }

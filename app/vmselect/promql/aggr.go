@@ -11,44 +11,42 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/storage"
 	"github.com/VictoriaMetrics/metrics"
 	"github.com/VictoriaMetrics/metricsql"
-	"github.com/cespare/xxhash/v2"
+	"github.com/valyala/histogram"
 )
 
 var aggrFuncs = map[string]aggrFunc{
-	"any":            aggrFuncAny,
-	"avg":            newAggrFunc(aggrFuncAvg),
-	"bottomk":        newAggrFuncTopK(true),
-	"bottomk_avg":    newAggrFuncRangeTopK(avgValue, true),
-	"bottomk_max":    newAggrFuncRangeTopK(maxValue, true),
-	"bottomk_median": newAggrFuncRangeTopK(medianValue, true),
-	"bottomk_last":   newAggrFuncRangeTopK(lastValue, true),
-	"bottomk_min":    newAggrFuncRangeTopK(minValue, true),
-	"count":          newAggrFunc(aggrFuncCount),
-	"count_values":   aggrFuncCountValues,
-	"distinct":       newAggrFunc(aggrFuncDistinct),
-	"geomean":        newAggrFunc(aggrFuncGeomean),
-	"group":          newAggrFunc(aggrFuncGroup),
-	"histogram":      newAggrFunc(aggrFuncHistogram),
-	"limitk":         aggrFuncLimitK,
-	"mad":            newAggrFunc(aggrFuncMAD),
-	"max":            newAggrFunc(aggrFuncMax),
+	// See https://prometheus.io/docs/prometheus/latest/querying/operators/#aggregation-operators
+	"sum":          newAggrFunc(aggrFuncSum),
+	"min":          newAggrFunc(aggrFuncMin),
+	"max":          newAggrFunc(aggrFuncMax),
+	"avg":          newAggrFunc(aggrFuncAvg),
+	"stddev":       newAggrFunc(aggrFuncStddev),
+	"stdvar":       newAggrFunc(aggrFuncStdvar),
+	"count":        newAggrFunc(aggrFuncCount),
+	"count_values": aggrFuncCountValues,
+	"bottomk":      newAggrFuncTopK(true),
+	"topk":         newAggrFuncTopK(false),
+	"quantile":     aggrFuncQuantile,
+	"group":        newAggrFunc(aggrFuncGroup),
+
+	// PromQL extension funcs
 	"median":         aggrFuncMedian,
-	"min":            newAggrFunc(aggrFuncMin),
-	"mode":           newAggrFunc(aggrFuncMode),
-	"outliers_mad":   aggrFuncOutliersMAD,
-	"outliersk":      aggrFuncOutliersK,
-	"quantile":       aggrFuncQuantile,
-	"quantiles":      aggrFuncQuantiles,
-	"stddev":         newAggrFunc(aggrFuncStddev),
-	"stdvar":         newAggrFunc(aggrFuncStdvar),
-	"sum":            newAggrFunc(aggrFuncSum),
+	"limitk":         aggrFuncLimitK,
+	"distinct":       newAggrFunc(aggrFuncDistinct),
 	"sum2":           newAggrFunc(aggrFuncSum2),
-	"topk":           newAggrFuncTopK(false),
-	"topk_avg":       newAggrFuncRangeTopK(avgValue, false),
-	"topk_max":       newAggrFuncRangeTopK(maxValue, false),
-	"topk_median":    newAggrFuncRangeTopK(medianValue, false),
-	"topk_last":      newAggrFuncRangeTopK(lastValue, false),
+	"geomean":        newAggrFunc(aggrFuncGeomean),
+	"histogram":      newAggrFunc(aggrFuncHistogram),
 	"topk_min":       newAggrFuncRangeTopK(minValue, false),
+	"topk_max":       newAggrFuncRangeTopK(maxValue, false),
+	"topk_avg":       newAggrFuncRangeTopK(avgValue, false),
+	"topk_median":    newAggrFuncRangeTopK(medianValue, false),
+	"bottomk_min":    newAggrFuncRangeTopK(minValue, true),
+	"bottomk_max":    newAggrFuncRangeTopK(maxValue, true),
+	"bottomk_avg":    newAggrFuncRangeTopK(avgValue, true),
+	"bottomk_median": newAggrFuncRangeTopK(medianValue, true),
+	"any":            aggrFuncAny,
+	"outliersk":      aggrFuncOutliersK,
+	"mode":           newAggrFunc(aggrFuncMode),
 	"zscore":         aggrFuncZScore,
 }
 
@@ -486,6 +484,7 @@ func aggrFuncZScore(afa *aggrFuncArg) ([]*timeseries, error) {
 				ts.Values[i] = (v - avg) / stddev
 			}
 		}
+
 		// Remove MetricGroup from all the tss.
 		for _, ts := range tss {
 			ts.MetricName.ResetMetricGroup()
@@ -576,7 +575,7 @@ func aggrFuncCountValues(afa *aggrFuncArg) ([]*timeseries, error) {
 			var dst timeseries
 			dst.CopyFromShallowTimestamps(tss[0])
 			dst.MetricName.RemoveTag(dstLabel)
-			dst.MetricName.AddTag(dstLabel, strconv.FormatFloat(v, 'f', -1, 64))
+			dst.MetricName.AddTag(dstLabel, strconv.FormatFloat(v, 'g', -1, 64))
 			for i := range dst.Values {
 				count := 0
 				for _, ts := range tss {
@@ -619,7 +618,7 @@ func newAggrFuncTopK(isReverse bool) aggrFunc {
 				})
 				fillNaNsAtIdx(n, ks[n], tss)
 			}
-			tss = removeEmptySeries(tss)
+			tss = removeNaNs(tss)
 			reverseSeries(tss)
 			return tss
 		}
@@ -686,7 +685,7 @@ func getRangeTopKTimeseries(tss []*timeseries, modifier *metricsql.ModifierExpr,
 	if remainingSumTS != nil {
 		tss = append(tss, remainingSumTS)
 	}
-	tss = removeEmptySeries(tss)
+	tss = removeNaNs(tss)
 	reverseSeries(tss)
 	return tss
 }
@@ -800,127 +799,15 @@ func avgValue(values []float64) float64 {
 }
 
 func medianValue(values []float64) float64 {
-	return quantile(0.5, values)
-}
-
-func lastValue(values []float64) float64 {
-	values = skipTrailingNaNs(values)
-	if len(values) == 0 {
-		return nan
-	}
-	return values[len(values)-1]
-}
-
-// quantiles calculates the given phis from originValues without modifying originValues, appends them to qs and returns the result.
-func quantiles(qs, phis []float64, originValues []float64) []float64 {
-	a := getFloat64s()
-	a.A = prepareForQuantileFloat64(a.A[:0], originValues)
-	qs = quantilesSorted(qs, phis, a.A)
-	putFloat64s(a)
-	return qs
-}
-
-// quantile calculates the given phi from originValues without modifying originValues
-func quantile(phi float64, originValues []float64) float64 {
-	a := getFloat64s()
-	a.A = prepareForQuantileFloat64(a.A[:0], originValues)
-	q := quantileSorted(phi, a.A)
-	putFloat64s(a)
-	return q
-}
-
-// prepareForQuantileFloat64 copies items from src to dst but removes NaNs and sorts the dst
-func prepareForQuantileFloat64(dst, src []float64) []float64 {
-	for _, v := range src {
-		if math.IsNaN(v) {
-			continue
+	h := histogram.GetFast()
+	for _, v := range values {
+		if !math.IsNaN(v) {
+			h.Update(v)
 		}
-		dst = append(dst, v)
 	}
-	sort.Float64s(dst)
-	return dst
-}
-
-// quantilesSorted calculates the given phis over a sorted list of values, appends them to qs and returns the result.
-//
-// It is expected that values won't contain NaN items.
-// The implementation mimics Prometheus implementation for compatibility's sake.
-func quantilesSorted(qs, phis []float64, values []float64) []float64 {
-	for _, phi := range phis {
-		q := quantileSorted(phi, values)
-		qs = append(qs, q)
-	}
-	return qs
-}
-
-// quantileSorted calculates the given quantile over a sorted list of values.
-//
-// It is expected that values won't contain NaN items.
-// The implementation mimics Prometheus implementation for compatibility's sake.
-func quantileSorted(phi float64, values []float64) float64 {
-	if len(values) == 0 || math.IsNaN(phi) {
-		return nan
-	}
-	if phi < 0 {
-		return math.Inf(-1)
-	}
-	if phi > 1 {
-		return math.Inf(+1)
-	}
-	n := float64(len(values))
-	rank := phi * (n - 1)
-
-	lowerIndex := math.Max(0, math.Floor(rank))
-	upperIndex := math.Min(n-1, lowerIndex+1)
-
-	weight := rank - math.Floor(rank)
-	return values[int(lowerIndex)]*(1-weight) + values[int(upperIndex)]*weight
-}
-
-func aggrFuncMAD(tss []*timeseries) []*timeseries {
-	// Calculate medians for each point across tss.
-	medians := getPerPointMedians(tss)
-	// Calculate MAD values multipled by tolerance for each point across tss.
-	// See https://en.wikipedia.org/wiki/Median_absolute_deviation
-	mads := getPerPointMADs(tss, medians)
-	tss[0].Values = append(tss[0].Values[:0], mads...)
-	return tss[:1]
-}
-
-func aggrFuncOutliersMAD(afa *aggrFuncArg) ([]*timeseries, error) {
-	args := afa.args
-	if err := expectTransformArgsNum(args, 2); err != nil {
-		return nil, err
-	}
-	tolerances, err := getScalar(args[0], 0)
-	if err != nil {
-		return nil, err
-	}
-	afe := func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries {
-		// Calculate medians for each point across tss.
-		medians := getPerPointMedians(tss)
-		// Calculate MAD values multipled by tolerance for each point across tss.
-		// See https://en.wikipedia.org/wiki/Median_absolute_deviation
-		mads := getPerPointMADs(tss, medians)
-		for n := range mads {
-			mads[n] *= tolerances[n]
-		}
-		// Leave only time series with at least a single peak above the MAD multiplied by tolerance.
-		tssDst := tss[:0]
-		for _, ts := range tss {
-			values := ts.Values
-			for n, v := range values {
-				ad := math.Abs(v - medians[n])
-				mad := mads[n]
-				if ad > mad {
-					tssDst = append(tssDst, ts)
-					break
-				}
-			}
-		}
-		return tssDst
-	}
-	return aggrFuncExt(afe, args[1], &afa.ae.Modifier, afa.ae.Limit, true)
+	value := h.Quantile(0.5)
+	histogram.PutFast(h)
+	return value
 }
 
 func aggrFuncOutliersK(afa *aggrFuncArg) ([]*timeseries, error) {
@@ -934,7 +821,20 @@ func aggrFuncOutliersK(afa *aggrFuncArg) ([]*timeseries, error) {
 	}
 	afe := func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries {
 		// Calculate medians for each point across tss.
-		medians := getPerPointMedians(tss)
+		medians := make([]float64, len(ks))
+		h := histogram.GetFast()
+		for n := range ks {
+			h.Reset()
+			for j := range tss {
+				v := tss[j].Values[n]
+				if !math.IsNaN(v) {
+					h.Update(v)
+				}
+			}
+			medians[n] = h.Quantile(0.5)
+		}
+		histogram.PutFast(h)
+
 		// Return topK time series with the highest variance from median.
 		f := func(values []float64) float64 {
 			sum2 := float64(0)
@@ -949,159 +849,38 @@ func aggrFuncOutliersK(afa *aggrFuncArg) ([]*timeseries, error) {
 	return aggrFuncExt(afe, args[1], &afa.ae.Modifier, afa.ae.Limit, true)
 }
 
-func getPerPointMedians(tss []*timeseries) []float64 {
-	if len(tss) == 0 {
-		logger.Panicf("BUG: expecting non-empty tss")
-	}
-	medians := make([]float64, len(tss[0].Values))
-	a := getFloat64s()
-	values := a.A
-	for n := range medians {
-		values = values[:0]
-		for j := range tss {
-			v := tss[j].Values[n]
-			if !math.IsNaN(v) {
-				values = append(values, v)
-			}
-		}
-		medians[n] = quantile(0.5, values)
-	}
-	a.A = values
-	putFloat64s(a)
-	return medians
-}
-
-func getPerPointMADs(tss []*timeseries, medians []float64) []float64 {
-	mads := make([]float64, len(medians))
-	a := getFloat64s()
-	values := a.A
-	for n, median := range medians {
-		values = values[:0]
-		for j := range tss {
-			v := tss[j].Values[n]
-			if !math.IsNaN(v) {
-				ad := math.Abs(v - median)
-				values = append(values, ad)
-			}
-		}
-		mads[n] = quantile(0.5, values)
-	}
-	a.A = values
-	putFloat64s(a)
-	return mads
-}
-
 func aggrFuncLimitK(afa *aggrFuncArg) ([]*timeseries, error) {
 	args := afa.args
 	if err := expectTransformArgsNum(args, 2); err != nil {
 		return nil, err
 	}
-	limits, err := getScalar(args[0], 0)
+	ks, err := getScalar(args[0], 0)
 	if err != nil {
-		return nil, fmt.Errorf("cannot obtain limit arg: %w", err)
+		return nil, err
 	}
-	limit := 0
-	if len(limits) > 0 {
-		limit = int(limits[0])
-	}
-	if limit < 0 {
-		limit = 0
+	maxK := 0
+	for _, kf := range ks {
+		k := int(kf)
+		if k > maxK {
+			maxK = k
+		}
 	}
 	afe := func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries {
-		// Sort series by metricName hash in order to get consistent set of output series
-		// across multiple calls to limitk() function.
-		// Sort series by hash in order to guarantee uniform selection across series.
-		type hashSeries struct {
-			h  uint64
-			ts *timeseries
+		if len(tss) > maxK {
+			tss = tss[:maxK]
 		}
-		hss := make([]hashSeries, len(tss))
-		d := xxhash.New()
-		for i, ts := range tss {
-			h := getHash(d, &ts.MetricName)
-			hss[i] = hashSeries{
-				h:  h,
-				ts: ts,
+		for i, kf := range ks {
+			k := int(kf)
+			if k < 0 {
+				k = 0
 			}
-		}
-		sort.Slice(hss, func(i, j int) bool {
-			return hss[i].h < hss[j].h
-		})
-		for i, hs := range hss {
-			tss[i] = hs.ts
-		}
-		if limit < len(tss) {
-			tss = tss[:limit]
+			for j := k; j < len(tss); j++ {
+				tss[j].Values[i] = nan
+			}
 		}
 		return tss
 	}
 	return aggrFuncExt(afe, args[1], &afa.ae.Modifier, afa.ae.Limit, true)
-}
-
-func getHash(d *xxhash.Digest, mn *storage.MetricName) uint64 {
-	d.Reset()
-	_, _ = d.Write(mn.MetricGroup)
-	for _, tag := range mn.Tags {
-		_, _ = d.Write(tag.Key)
-		_, _ = d.Write(tag.Value)
-	}
-	return d.Sum64()
-
-}
-
-func aggrFuncQuantiles(afa *aggrFuncArg) ([]*timeseries, error) {
-	args := afa.args
-	if len(args) < 3 {
-		return nil, fmt.Errorf("unexpected number of args: %d; expecting at least 3 args", len(args))
-	}
-	dstLabel, err := getString(args[0], 0)
-	if err != nil {
-		return nil, fmt.Errorf("cannot obtain dstLabel: %w", err)
-	}
-	phiArgs := args[1 : len(args)-1]
-	phis := make([]float64, len(phiArgs))
-	for i, phiArg := range phiArgs {
-		phisLocal, err := getScalar(phiArg, i+1)
-		if err != nil {
-			return nil, err
-		}
-		if len(phis) == 0 {
-			logger.Panicf("BUG: expecting at least a single sample")
-		}
-		phis[i] = phisLocal[0]
-	}
-	argOrig := args[len(args)-1]
-	afe := func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries {
-		tssDst := make([]*timeseries, len(phiArgs))
-		for j := range tssDst {
-			ts := &timeseries{}
-			ts.CopyFromShallowTimestamps(tss[0])
-			ts.MetricName.RemoveTag(dstLabel)
-			ts.MetricName.AddTag(dstLabel, fmt.Sprintf("%g", phis[j]))
-			tssDst[j] = ts
-		}
-
-		b := getFloat64s()
-		qs := b.A
-		a := getFloat64s()
-		values := a.A
-		for n := range tss[0].Values {
-			values = values[:0]
-			for j := range tss {
-				values = append(values, tss[j].Values[n])
-			}
-			qs = quantiles(qs[:0], phis, values)
-			for j := range tssDst {
-				tssDst[j].Values[n] = qs[j]
-			}
-		}
-		a.A = values
-		putFloat64s(a)
-		b.A = qs
-		putFloat64s(b)
-		return tssDst
-	}
-	return aggrFuncExt(afe, argOrig, &afa.ae.Modifier, afa.ae.Limit, false)
 }
 
 func aggrFuncQuantile(afa *aggrFuncArg) ([]*timeseries, error) {
@@ -1130,17 +909,19 @@ func aggrFuncMedian(afa *aggrFuncArg) ([]*timeseries, error) {
 func newAggrQuantileFunc(phis []float64) func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries {
 	return func(tss []*timeseries, modifier *metricsql.ModifierExpr) []*timeseries {
 		dst := tss[0]
-		a := getFloat64s()
-		values := a.A
+		h := histogram.GetFast()
+		defer histogram.PutFast(h)
 		for n := range dst.Values {
-			values = values[:0]
+			h.Reset()
 			for j := range tss {
-				values = append(values, tss[j].Values[n])
+				v := tss[j].Values[n]
+				if !math.IsNaN(v) {
+					h.Update(v)
+				}
 			}
-			dst.Values[n] = quantile(phis[n], values)
+			phi := phis[n]
+			dst.Values[n] = h.Quantile(phi)
 		}
-		a.A = values
-		putFloat64s(a)
 		tss[0] = dst
 		return tss[:1]
 	}

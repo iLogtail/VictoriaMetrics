@@ -5,46 +5,26 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	textTpl "text/template"
+	"text/template"
 	"time"
 
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/templates"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmalert/utils"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbmarshal"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 )
 
 // Alert the triggered alert
 // TODO: Looks like alert name isn't unique
 type Alert struct {
-	// GroupID contains the ID of the parent rules group
-	GroupID uint64
-	// Name represents Alert name
-	Name string
-	// Labels is the list of label-value pairs attached to the Alert
-	Labels map[string]string
-	// Annotations is the list of annotations generated on Alert evaluation
+	GroupID     uint64
+	Name        string
+	Labels      map[string]string
 	Annotations map[string]string
-	// State represents the current state of the Alert
-	State AlertState
-	// Expr contains expression that was executed to generate the Alert
-	Expr string
-	// ActiveAt defines the moment of time when Alert has become active
-	ActiveAt time.Time
-	// Start defines the moment of time when Alert has become firing
+	State       AlertState
+
+	Expr  string
 	Start time.Time
-	// End defines the moment of time when Alert supposed to expire
-	End time.Time
-	// ResolvedAt defines the moment when Alert was switched from Firing to Inactive
-	ResolvedAt time.Time
-	// LastSent defines the moment when Alert was sent last time
-	LastSent time.Time
-	// Value stores the value returned from evaluating expression from Expr field
+	End   time.Time
 	Value float64
-	// ID is the unique identifer for the Alert
-	ID uint64
-	// Restored is true if Alert was restored after restart
-	Restored bool
+	ID    uint64
 }
 
 // AlertState type indicates the Alert state
@@ -74,75 +54,49 @@ func (as AlertState) String() string {
 
 // AlertTplData is used to execute templating
 type AlertTplData struct {
-	Labels   map[string]string
-	Value    float64
-	Expr     string
-	AlertID  uint64
-	GroupID  uint64
-	ActiveAt time.Time
+	Labels map[string]string
+	Value  float64
+	Expr   string
 }
 
-var tplHeaders = []string{
-	"{{ $value := .Value }}",
-	"{{ $labels := .Labels }}",
-	"{{ $expr := .Expr }}",
-	"{{ $externalLabels := .ExternalLabels }}",
-	"{{ $externalURL := .ExternalURL }}",
-	"{{ $alertID := .AlertID }}",
-	"{{ $groupID := .GroupID }}",
-	"{{ $activeAt := .ActiveAt }}",
-}
+const tplHeader = `{{ $value := .Value }}{{ $labels := .Labels }}{{ $expr := .Expr }}`
 
 // ExecTemplate executes the Alert template for given
 // map of annotations.
 // Every alert could have a different datasource, so function
 // requires a queryFunction as an argument.
-func (a *Alert) ExecTemplate(q templates.QueryFn, labels, annotations map[string]string) (map[string]string, error) {
-	tplData := AlertTplData{Value: a.Value, Labels: labels, Expr: a.Expr, AlertID: a.ID, GroupID: a.GroupID, ActiveAt: a.ActiveAt}
-	tmpl, err := templates.GetWithFuncs(templates.FuncsWithQuery(q))
-	if err != nil {
-		return nil, fmt.Errorf("error getting a template: %w", err)
-	}
-	return templateAnnotations(annotations, tplData, tmpl, true)
+func (a *Alert) ExecTemplate(q QueryFn, annotations map[string]string) (map[string]string, error) {
+	tplData := AlertTplData{Value: a.Value, Labels: a.Labels, Expr: a.Expr}
+	return templateAnnotations(annotations, tplData, funcsWithQuery(q))
 }
 
 // ExecTemplate executes the given template for given annotations map.
-func ExecTemplate(q templates.QueryFn, annotations map[string]string, tplData AlertTplData) (map[string]string, error) {
-	tmpl, err := templates.GetWithFuncs(templates.FuncsWithQuery(q))
-	if err != nil {
-		return nil, fmt.Errorf("error cloning template: %w", err)
-	}
-	return templateAnnotations(annotations, tplData, tmpl, true)
+func ExecTemplate(q QueryFn, annotations map[string]string, tpl AlertTplData) (map[string]string, error) {
+	return templateAnnotations(annotations, tpl, funcsWithQuery(q))
 }
 
 // ValidateTemplates validate annotations for possible template error, uses empty data for template population
 func ValidateTemplates(annotations map[string]string) error {
-	tmpl, err := templates.Get()
-	if err != nil {
-		return err
-	}
-	_, err = templateAnnotations(annotations, AlertTplData{
+	_, err := templateAnnotations(annotations, AlertTplData{
 		Labels: map[string]string{},
 		Value:  0,
-	}, tmpl, false)
+	}, tmplFunc)
 	return err
 }
 
-func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl *textTpl.Template, execute bool) (map[string]string, error) {
+func templateAnnotations(annotations map[string]string, data AlertTplData, funcs template.FuncMap) (map[string]string, error) {
 	var builder strings.Builder
 	var buf bytes.Buffer
 	eg := new(utils.ErrGroup)
 	r := make(map[string]string, len(annotations))
-	tData := tplData{data, externalLabels, externalURL}
-	header := strings.Join(tplHeaders, "")
 	for key, text := range annotations {
+		r[key] = text
 		buf.Reset()
 		builder.Reset()
-		builder.Grow(len(header) + len(text))
-		builder.WriteString(header)
+		builder.Grow(len(tplHeader) + len(text))
+		builder.WriteString(tplHeader)
 		builder.WriteString(text)
-		if err := templateAnnotation(&buf, builder.String(), tData, tmpl, execute); err != nil {
-			r[key] = text
+		if err := templateAnnotation(&buf, builder.String(), data, funcs); err != nil {
 			eg.Add(fmt.Errorf("key %q, template %q: %w", key, text, err))
 			continue
 		}
@@ -151,41 +105,14 @@ func templateAnnotations(annotations map[string]string, data AlertTplData, tmpl 
 	return r, eg.Err()
 }
 
-type tplData struct {
-	AlertTplData
-	ExternalLabels map[string]string
-	ExternalURL    string
-}
-
-func templateAnnotation(dst io.Writer, text string, data tplData, tmpl *textTpl.Template, execute bool) error {
-	tpl, err := tmpl.Clone()
+func templateAnnotation(dst io.Writer, text string, data AlertTplData, funcs template.FuncMap) error {
+	t := template.New("").Funcs(funcs).Option("missingkey=zero")
+	tpl, err := t.Parse(text)
 	if err != nil {
-		return fmt.Errorf("error cloning template before parse annotation: %w", err)
-	}
-	tpl, err = tpl.Parse(text)
-	if err != nil {
-		return fmt.Errorf("error parsing annotation template: %w", err)
-	}
-	if !execute {
-		return nil
+		return fmt.Errorf("error parsing annotation: %w", err)
 	}
 	if err = tpl.Execute(dst, data); err != nil {
 		return fmt.Errorf("error evaluating annotation template: %w", err)
 	}
 	return nil
-}
-
-func (a Alert) toPromLabels(relabelCfg *promrelabel.ParsedConfigs) []prompbmarshal.Label {
-	var labels []prompbmarshal.Label
-	for k, v := range a.Labels {
-		labels = append(labels, prompbmarshal.Label{
-			Name:  k,
-			Value: v,
-		})
-	}
-	promrelabel.SortLabels(labels)
-	if relabelCfg != nil {
-		return relabelCfg.Apply(labels, 0, false)
-	}
-	return labels
 }

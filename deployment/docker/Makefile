@@ -2,11 +2,11 @@
 
 DOCKER_NAMESPACE := victoriametrics
 
-ROOT_IMAGE ?= alpine:3.16.2
-CERTS_IMAGE := alpine:3.16.2
-GO_BUILDER_IMAGE := golang:1.19.1-alpine
-BUILDER_IMAGE := local/builder:2.0.0-$(shell echo $(GO_BUILDER_IMAGE) | tr :/ __)-1
-BASE_IMAGE := local/base:1.1.3-$(shell echo $(ROOT_IMAGE) | tr :/ __)-$(shell echo $(CERTS_IMAGE) | tr :/ __)
+ROOT_IMAGE ?= alpine:3.13.2
+CERTS_IMAGE := alpine:3.13.2
+GO_BUILDER_IMAGE := golang:1.16.3
+BUILDER_IMAGE := local/builder:2.0.0-$(shell echo $(GO_BUILDER_IMAGE) | tr : _)
+BASE_IMAGE := local/base:1.1.3-$(shell echo $(ROOT_IMAGE) | tr : _)-$(shell echo $(CERTS_IMAGE) | tr : _)
 
 package-base:
 	(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -q '$(BASE_IMAGE)$$') \
@@ -15,9 +15,6 @@ package-base:
 			--build-arg certs_image=$(CERTS_IMAGE) \
 			--tag $(BASE_IMAGE) \
 			deployment/docker/base
-
-docker-scan: package-base
-	docker scan --accept-license $(BASE_IMAGE) || (echo "❌ The build has been terminated because critical vulnerabilities were found in $(BASE_IMAGE)"; exit 1)
 
 package-builder:
 	(docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -q '$(BUILDER_IMAGE)$$') \
@@ -34,11 +31,12 @@ app-via-docker: package-builder
 		-w /VictoriaMetrics \
 		--mount type=bind,src="$(shell pwd)/gocache-for-docker",dst=/gocache \
 		--env GOCACHE=/gocache \
+		--env GO111MODULE=on \
 		$(DOCKER_OPTS) \
 		$(BUILDER_IMAGE) \
-		go build $(RACE) -trimpath -buildvcs=false \
+		go build $(RACE) -mod=vendor -trimpath \
 			-ldflags "-extldflags '-static' $(GO_BUILDINFO)" \
-			-tags 'netgo osusergo nethttpomithttp2 musl' \
+			-tags 'netgo osusergo nethttpomithttp2' \
 			-o bin/$(APP_NAME)$(APP_SUFFIX)-prod $(PKG_PREFIX)/app/$(APP_NAME)
 
 app-via-docker-windows: package-builder
@@ -49,9 +47,10 @@ app-via-docker-windows: package-builder
 		-w /VictoriaMetrics \
 		--mount type=bind,src="$(shell pwd)/gocache-for-docker",dst=/gocache \
 		--env GOCACHE=/gocache \
+		--env GO111MODULE=on \
 		$(DOCKER_OPTS) \
 		$(BUILDER_IMAGE) \
-		go build $(RACE) -trimpath -buildvcs=false \
+		go build $(RACE) -mod=vendor -trimpath \
 			-ldflags "-s -w -extldflags '-static' $(GO_BUILDINFO)" \
 			-tags 'netgo osusergo nethttpomithttp2' \
 			-o bin/$(APP_NAME)-windows$(APP_SUFFIX)-prod.exe $(PKG_PREFIX)/app/$(APP_NAME)
@@ -66,11 +65,11 @@ package-via-docker: package-base
 			-f app/$(APP_NAME)/deployment/Dockerfile bin)
 
 publish-via-docker: \
-	app-via-docker-linux-amd64 \
-	app-via-docker-linux-arm \
-	app-via-docker-linux-arm64 \
-	app-via-docker-linux-ppc64le \
-	app-via-docker-linux-386
+	app-via-docker-amd64 \
+	app-via-docker-arm \
+	app-via-docker-arm64 \
+	app-via-docker-ppc64le \
+	app-via-docker-386
 	docker buildx build \
 		--platform=linux/amd64,linux/arm,linux/arm64,linux/ppc64le,linux/386 \
 		--build-arg certs_image=$(CERTS_IMAGE) \
@@ -90,60 +89,46 @@ run-via-docker: package-via-docker
 		$(DOCKER_OPTS) \
 		$(DOCKER_NAMESPACE)/$(APP_NAME):$(PKG_TAG)$(APP_SUFFIX)$(RACE) $(ARGS)
 
-app-via-docker-goos-goarch:
-	APP_SUFFIX='-$(GOOS)-$(GOARCH)' \
-	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=$(GOOS) --env GOARCH=$(GOARCH)' \
+app-via-docker-goarch:
+	APP_SUFFIX='-$(GOARCH)' \
+	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=linux --env GOARCH=$(GOARCH)' \
 	$(MAKE) app-via-docker
+
+app-via-docker-windows-goarch:
+	APP_SUFFIX='-$(GOARCH)' \
+	DOCKER_OPTS='--env CGO_ENABLED=0 --env GOOS=windows --env GOARCH=$(GOARCH)' \
+	$(MAKE) app-via-docker-windows
+
+app-via-docker-goarch-cgo:
+	CGO_ENABLED=1 $(MAKE) app-via-docker-goarch
+
+app-via-docker-goarch-nocgo:
+	CGO_ENABLED=0 $(MAKE) app-via-docker-goarch
 
 app-via-docker-pure:
 	APP_SUFFIX='-pure' DOCKER_OPTS='--env CGO_ENABLED=0' $(MAKE) app-via-docker
 
-app-via-docker-linux-amd64:
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 $(MAKE) app-via-docker-goos-goarch
+app-via-docker-amd64:
+	GOARCH=amd64 $(MAKE) app-via-docker-goarch-cgo
 
-app-via-docker-linux-arm:
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm $(MAKE) app-via-docker-goos-goarch
+app-via-docker-arm:
+	GOARCH=arm $(MAKE) app-via-docker-goarch-nocgo
 
-app-via-docker-linux-arm64:
-ifeq ($(APP_NAME),vmagent)
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(MAKE) app-via-docker-goos-goarch
-else
-	APP_SUFFIX='-linux-arm64' \
-	DOCKER_OPTS='--env CGO_ENABLED=1 --env GOOS=linux --env GOARCH=arm64 --env CC=/opt/cross-builder/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc' \
-	$(MAKE) app-via-docker
-endif
+app-via-docker-arm64:
+	GOARCH=arm64 $(MAKE) app-via-docker-goarch-nocgo
 
-app-via-docker-linux-ppc64le:
-	CGO_ENABLED=0 GOOS=linux GOARCH=ppc64le $(MAKE) app-via-docker-goos-goarch
+app-via-docker-ppc64le:
+	GOARCH=ppc64le $(MAKE) app-via-docker-goarch-nocgo
 
-app-via-docker-linux-386:
-	CGO_ENABLED=0 GOOS=linux GOARCH=386 $(MAKE) app-via-docker-goos-goarch
-
-app-via-docker-darwin-amd64:
-	CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 $(MAKE) app-via-docker-goos-goarch
-
-app-via-docker-darwin-arm64:
-	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(MAKE) app-via-docker-goos-goarch
-
-app-via-docker-freebsd-amd64:
-	CGO_ENABLED=0 GOOS=freebsd GOARCH=amd64 $(MAKE) app-via-docker-goos-goarch
-
-app-via-docker-openbsd-amd64:
-	CGO_ENABLED=0 GOOS=openbsd GOARCH=amd64 $(MAKE) app-via-docker-goos-goarch
+app-via-docker-386:
+	GOARCH=386 $(MAKE) app-via-docker-goarch-nocgo
 
 app-via-docker-windows-amd64:
-	APP_SUFFIX='-$(GOARCH)' \
-	DOCKER_OPTS='--env CGO_ENABLED=0 --env GOOS=windows --env GOARCH=amd64' \
-	$(MAKE) app-via-docker-windows
+	GOARCH=amd64 $(MAKE) app-via-docker-windows-goarch
 
 package-via-docker-goarch:
 	APP_SUFFIX='-$(GOARCH)' \
 	DOCKER_OPTS='--env CGO_ENABLED=$(CGO_ENABLED) --env GOOS=linux --env GOARCH=$(GOARCH)' \
-	$(MAKE) package-via-docker
-
-package-via-docker-goarch-arm64:
-	APP_SUFFIX='-arm64' \
-	DOCKER_OPTS='--env CGO_ENABLED=1 --env GOOS=linux --env GOARCH=arm64 --env CC=/opt/cross-builder/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc' \
 	$(MAKE) package-via-docker
 
 package-via-docker-goarch-cgo:
@@ -162,12 +147,7 @@ package-via-docker-arm:
 	GOARCH=arm $(MAKE) package-via-docker-goarch-nocgo
 
 package-via-docker-arm64:
-ifeq ($(APP_NAME),vmagent)
 	GOARCH=arm64 $(MAKE) package-via-docker-goarch-nocgo
-else
-	$(MAKE) package-via-docker-goarch-arm64
-endif
-
 
 package-via-docker-ppc64le:
 	GOARCH=ppc64le $(MAKE) package-via-docker-goarch-nocgo
@@ -176,17 +156,4 @@ package-via-docker-386:
 	GOARCH=386 $(MAKE) package-via-docker-goarch-nocgo
 
 remove-docker-images:
-	docker image ls --format '{{.Repository}}\t{{.ID}}' | awk '{print $$2}' | xargs docker image rm -f
-
-
-docker-single-up:
-	docker-compose -f deployment/docker/docker-compose.yml up
-
-docker-single-down:
-	docker-compose -f deployment/docker/docker-compose.yml down -v
-
-docker-cluster-up:
-	docker-compose -f deployment/docker/docker-compose-cluster.yml up
-
-docker-cluster-down:
-	docker-compose -f deployment/docker/docker-compose-cluster.yml down -v
+	docker image ls --format '{{.Repository}}\t{{.ID}}' | grep $(DOCKER_NAMESPACE)/ | grep -v /builder | awk '{print $$2}' | xargs docker image rm -f

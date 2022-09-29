@@ -37,9 +37,6 @@ type FS struct {
 	// Set for using S3-compatible enpoint such as MinIO etc.
 	CustomEndpoint string
 
-	// Force to use path style for s3, true by default.
-	S3ForcePathStyle bool
-
 	// The name of S3 config profile to use.
 	ProfileName string
 
@@ -78,15 +75,10 @@ func (fs *FS) Init() error {
 	if len(fs.CustomEndpoint) > 0 {
 		// Use provided custom endpoint for S3
 		logger.Infof("Using provided custom S3 endpoint: %q", fs.CustomEndpoint)
-		// hack for https://github.com/VictoriaMetrics/VictoriaMetrics/issues/1449
-		if sess.Config.Region == nil || *sess.Config.Region == "" {
-			logger.Infof("Region is not defined for custom S3 endpoint, using `us-east-1` as default")
-			sess.Config.WithRegion("us-east-1")
-		}
 		sess.Config.WithEndpoint(fs.CustomEndpoint)
 
 		// Disable prefixing endpoint with bucket name
-		sess.Config.WithS3ForcePathStyle(fs.S3ForcePathStyle)
+		sess.Config.WithS3ForcePathStyle(true)
 	} else {
 		// Determine bucket region.
 		ctx := context.Background()

@@ -2,11 +2,8 @@ package common
 
 import (
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
-	"strings"
-	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 )
@@ -38,9 +35,8 @@ func ReadLinesBlock(r io.Reader, dstBuf, tailBuf []byte) ([]byte, []byte, error)
 //
 // It is expected that read timeout on r exceeds 1 second.
 func ReadLinesBlockExt(r io.Reader, dstBuf, tailBuf []byte, maxLineLen int) ([]byte, []byte, error) {
-	startTime := time.Now()
 	if cap(dstBuf) < defaultBlockSize {
-		dstBuf = bytesutil.ResizeNoCopyNoOverallocate(dstBuf, defaultBlockSize)
+		dstBuf = bytesutil.Resize(dstBuf, defaultBlockSize)
 	}
 	dstBuf = append(dstBuf[:0], tailBuf...)
 	tailBuf = tailBuf[:0]
@@ -52,18 +48,12 @@ again:
 		if err == nil {
 			return dstBuf, tailBuf, fmt.Errorf("no forward progress made")
 		}
-		isEOF := isEOFLikeError(err)
-		if isEOF && len(dstBuf) > 0 {
+		if err == io.EOF && len(dstBuf) > 0 {
 			// Missing newline in the end of stream. This is OK,
 			// so suppress io.EOF for now. It will be returned during the next
 			// call to ReadLinesBlock.
 			// This fixes https://github.com/VictoriaMetrics/VictoriaMetrics/issues/60 .
 			return dstBuf, tailBuf, nil
-		}
-		if !isEOF {
-			err = fmt.Errorf("cannot read a block of data in %.3fs: %w", time.Since(startTime).Seconds(), err)
-		} else {
-			err = io.EOF
 		}
 		return dstBuf, tailBuf, err
 	}
@@ -79,7 +69,7 @@ again:
 		if cap(dstBuf) < 2*len(dstBuf) {
 			// Increase dsbBuf capacity, so more data could be read into it.
 			dstBufLen := len(dstBuf)
-			dstBuf = bytesutil.ResizeWithCopyNoOverallocate(dstBuf, 2*cap(dstBuf))
+			dstBuf = bytesutil.Resize(dstBuf, 2*cap(dstBuf))
 			dstBuf = dstBuf[:dstBufLen]
 		}
 		goto again
@@ -90,12 +80,4 @@ again:
 	tailBuf = append(tailBuf[:0], dstBuf[nn+1:]...)
 	dstBuf = dstBuf[:nn]
 	return dstBuf, tailBuf, nil
-}
-
-func isEOFLikeError(err error) bool {
-	if errors.Is(err, io.EOF) {
-		return true
-	}
-	s := err.Error()
-	return strings.Contains(s, "reset by peer")
 }

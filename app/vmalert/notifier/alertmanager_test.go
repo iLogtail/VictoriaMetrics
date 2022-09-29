@@ -8,20 +8,7 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promauth"
 )
-
-func TestAlertManager_Addr(t *testing.T) {
-	const addr = "http://localhost"
-	am, err := NewAlertManager(addr, nil, promauth.HTTPClientConfig{}, nil, 0)
-	if err != nil {
-		t.Errorf("unexpected error: %s", err)
-	}
-	if am.Addr() != addr {
-		t.Errorf("expected to have %q; got %q", addr, am.Addr())
-	}
-}
 
 func TestAlertManager_Send(t *testing.T) {
 	const baUser, baPass = "foo", "bar"
@@ -80,19 +67,9 @@ func TestAlertManager_Send(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
-
-	aCfg := promauth.HTTPClientConfig{
-		BasicAuth: &promauth.BasicAuthConfig{
-			Username: baUser,
-			Password: promauth.NewSecret(baPass),
-		},
-	}
-	am, err := NewAlertManager(srv.URL+alertManagerPath, func(alert Alert) string {
+	am := NewAlertManager(srv.URL, baUser, baPass, func(alert Alert) string {
 		return strconv.FormatUint(alert.GroupID, 10) + "/" + strconv.FormatUint(alert.ID, 10)
-	}, aCfg, nil, 0)
-	if err != nil {
-		t.Errorf("unexpected error: %s", err)
-	}
+	}, srv.Client())
 	if err := am.Send(context.Background(), []Alert{{}, {}}); err == nil {
 		t.Error("expected connection error got nil")
 	}

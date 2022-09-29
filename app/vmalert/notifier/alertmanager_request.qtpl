@@ -1,11 +1,9 @@
 {% import (
     "time"
-
-    "github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 ) %}
 {% stripspace %}
 
-{% func amRequest(alerts []Alert, generatorURL func(Alert) string, relabelCfg *promrelabel.ParsedConfigs) %}
+{% func amRequest(alerts []Alert, generatorURL func(Alert) string) %}
 [
 {% for i, alert := range alerts %}
 {
@@ -16,9 +14,8 @@
     {% endif %}
     "labels": {
         "alertname":{%q= alert.Name %}
-        {% code lbls := alert.toPromLabels(relabelCfg) %}
-        {% for _, l := range lbls %}
-            ,{%q= l.Name %}:{%q= l.Value %}
+        {% for k,v := range alert.Labels %}
+            ,{%q= k %}:{%q= v %}
         {% endfor %}
     },
     "annotations": {

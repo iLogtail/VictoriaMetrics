@@ -1,75 +1,28 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/urfave/cli/v2"
-
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/influx"
-	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/opentsdb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/prometheus"
 	"github.com/VictoriaMetrics/VictoriaMetrics/app/vmctl/vm"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/buildinfo"
-	"github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/common"
-	parser "github.com/VictoriaMetrics/VictoriaMetrics/lib/protoparser/native"
+	"github.com/urfave/cli/v2"
 )
 
 func main() {
-	var (
-		err      error
-		importer *vm.Importer
-	)
-
-	ctx, cancelCtx := context.WithCancel(context.Background())
 	start := time.Now()
 	app := &cli.App{
 		Name:    "vmctl",
-		Usage:   "VictoriaMetrics command-line tool",
+		Usage:   "Victoria metrics command-line tool",
 		Version: buildinfo.Version,
 		Commands: []*cli.Command{
-			{
-				Name:  "opentsdb",
-				Usage: "Migrate timeseries from OpenTSDB",
-				Flags: mergeFlags(globalFlags, otsdbFlags, vmFlags),
-				Action: func(c *cli.Context) error {
-					fmt.Println("OpenTSDB import mode")
-
-					oCfg := opentsdb.Config{
-						Addr:       c.String(otsdbAddr),
-						Limit:      c.Int(otsdbQueryLimit),
-						Offset:     c.Int64(otsdbOffsetDays),
-						HardTS:     c.Int64(otsdbHardTSStart),
-						Retentions: c.StringSlice(otsdbRetentions),
-						Filters:    c.StringSlice(otsdbFilters),
-						Normalize:  c.Bool(otsdbNormalize),
-						MsecsTime:  c.Bool(otsdbMsecsTime),
-					}
-					otsdbClient, err := opentsdb.NewClient(oCfg)
-					if err != nil {
-						return fmt.Errorf("failed to create opentsdb client: %s", err)
-					}
-
-					vmCfg := initConfigVM(c)
-					// disable progress bars since openTSDB implementation
-					// does not use progress bar pool
-					vmCfg.DisableProgressBar = true
-					importer, err := vm.NewImporter(vmCfg)
-					if err != nil {
-						return fmt.Errorf("failed to create VM importer: %s", err)
-					}
-
-					otsdbProcessor := newOtsdbProcessor(otsdbClient, importer, c.Int(otsdbConcurrency))
-					return otsdbProcessor.run(c.Bool(globalSilent), c.Bool(globalVerbose))
-				},
-			},
 			{
 				Name:  "influx",
 				Usage: "Migrate timeseries from InfluxDB",
@@ -96,19 +49,14 @@ func main() {
 					}
 
 					vmCfg := initConfigVM(c)
-					importer, err = vm.NewImporter(vmCfg)
+					importer, err := vm.NewImporter(vmCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create VM importer: %s", err)
 					}
 
-					processor := newInfluxProcessor(
-						influxClient,
-						importer,
-						c.Int(influxConcurrency),
-						c.String(influxMeasurementFieldSeparator),
-						c.Bool(influxSkipDatabaseLabel),
-						c.Bool(influxPrometheusMode))
-					return processor.run(c.Bool(globalSilent), c.Bool(globalVerbose))
+					processor := newInfluxProcessor(influxClient, importer,
+						c.Int(influxConcurrency), c.String(influxMeasurementFieldSeparator))
+					return processor.run(c.Bool(globalSilent))
 				},
 			},
 			{
@@ -119,7 +67,7 @@ func main() {
 					fmt.Println("Prometheus import mode")
 
 					vmCfg := initConfigVM(c)
-					importer, err = vm.NewImporter(vmCfg)
+					importer, err := vm.NewImporter(vmCfg)
 					if err != nil {
 						return fmt.Errorf("failed to create VM importer: %s", err)
 					}
@@ -142,7 +90,7 @@ func main() {
 						im: importer,
 						cc: c.Int(promConcurrency),
 					}
-					return pp.run(c.Bool(globalSilent), c.Bool(globalVerbose))
+					return pp.run(c.Bool(globalSilent))
 				},
 			},
 			{
@@ -157,12 +105,10 @@ func main() {
 					}
 
 					p := vmNativeProcessor{
-						rateLimit: c.Int64(vmRateLimit),
 						filter: filter{
 							match:     c.String(vmNativeFilterMatch),
 							timeStart: c.String(vmNativeFilterTimeStart),
 							timeEnd:   c.String(vmNativeFilterTimeEnd),
-							chunk:     c.String(vmNativeStepInterval),
 						},
 						src: &vmNativeClient{
 							addr:     strings.Trim(c.String(vmNativeSrcAddr), "/"),
@@ -176,40 +122,7 @@ func main() {
 							extraLabels: c.StringSlice(vmExtraLabel),
 						},
 					}
-					return p.run(ctx)
-				},
-			},
-			{
-				Name:  "verify-block",
-				Usage: "Verifies exported block with VictoriaMetrics Native format",
-				Flags: []cli.Flag{
-					&cli.BoolFlag{
-						Name:  "gunzip",
-						Usage: "Use GNU zip decompression for exported block",
-						Value: false,
-					},
-				},
-				Action: func(c *cli.Context) error {
-					common.StartUnmarshalWorkers()
-					blockPath := c.Args().First()
-					isBlockGzipped := c.Bool("gunzip")
-					if len(blockPath) == 0 {
-						return cli.Exit("you must provide path for exported data block", 1)
-					}
-					log.Printf("verifying block at path=%q", blockPath)
-					f, err := os.OpenFile(blockPath, os.O_RDONLY, 0600)
-					if err != nil {
-						return cli.Exit(fmt.Errorf("cannot open exported block at path=%q err=%w", blockPath, err), 1)
-					}
-					var blocksCount uint64
-					if err := parser.ParseStream(f, isBlockGzipped, func(block *parser.Block) error {
-						atomic.AddUint64(&blocksCount, 1)
-						return nil
-					}); err != nil {
-						return cli.Exit(fmt.Errorf("cannot parse block at path=%q, blocksCount=%d, err=%w", blockPath, blocksCount, err), 1)
-					}
-					log.Printf("successfully verified block at path=%q, blockCount=%d", blockPath, blocksCount)
-					return nil
+					return p.run()
 				},
 			},
 		},
@@ -220,15 +133,12 @@ func main() {
 	go func() {
 		<-c
 		fmt.Println("\r- Execution cancelled")
-		if importer != nil {
-			importer.Close()
-		}
-		cancelCtx()
+		os.Exit(0)
 	}()
 
-	err = app.Run(os.Args)
+	err := app.Run(os.Args)
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatal(err)
 	}
 	log.Printf("Total time: %v", time.Since(start))
 }
@@ -245,7 +155,5 @@ func initConfigVM(c *cli.Context) vm.Config {
 		SignificantFigures: c.Int(vmSignificantFigures),
 		RoundDigits:        c.Int(vmRoundDigits),
 		ExtraLabels:        c.StringSlice(vmExtraLabel),
-		RateLimit:          c.Int64(vmRateLimit),
-		DisableProgressBar: c.Bool(vmDisableProgressBar),
 	}
 }

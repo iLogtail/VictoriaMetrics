@@ -16,9 +16,6 @@ var binaryOps = map[string]bool{
 	"%": true,
 	"^": true,
 
-	// See https://github.com/prometheus/prometheus/pull/9248
-	"atan2": true,
-
 	// cmp ops
 	"==": true,
 	"!=": true,
@@ -60,10 +57,9 @@ var binaryOpPriorities = map[string]int{
 	"+": 4,
 	"-": 4,
 
-	"*":     5,
-	"/":     5,
-	"%":     5,
-	"atan2": 5,
+	"*": 5,
+	"/": 5,
+	"%": 5,
 
 	"^": 6,
 }
@@ -144,7 +140,6 @@ func isBinaryOpLogicalSet(op string) bool {
 }
 
 func binaryOpEvalNumber(op string, left, right float64, isBool bool) float64 {
-	op = strings.ToLower(op)
 	if IsBinaryOpCmp(op) {
 		evalCmp := func(cf func(left, right float64) bool) float64 {
 			if isBool {
@@ -186,8 +181,6 @@ func binaryOpEvalNumber(op string, left, right float64, isBool bool) float64 {
 			left = binaryop.Div(left, right)
 		case "%":
 			left = binaryop.Mod(left, right)
-		case "atan2":
-			left = binaryop.Atan2(left, right)
 		case "^":
 			left = binaryop.Pow(left, right)
 		case "and":

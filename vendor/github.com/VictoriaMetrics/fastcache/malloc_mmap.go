@@ -1,4 +1,3 @@
-//go:build !appengine && !windows
 // +build !appengine,!windows
 
 package fastcache
@@ -6,9 +5,8 @@ package fastcache
 import (
 	"fmt"
 	"sync"
+	"syscall"
 	"unsafe"
-
-	"golang.org/x/sys/unix"
 )
 
 const chunksPerAlloc = 1024
@@ -23,7 +21,7 @@ func getChunk() []byte {
 	if len(freeChunks) == 0 {
 		// Allocate offheap memory, so GOGC won't take into account cache size.
 		// This should reduce free memory waste.
-		data, err := unix.Mmap(-1, 0, chunkSize*chunksPerAlloc, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+		data, err := syscall.Mmap(-1, 0, chunkSize*chunksPerAlloc, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
 		if err != nil {
 			panic(fmt.Errorf("cannot allocate %d bytes via mmap: %s", chunkSize*chunksPerAlloc, err))
 		}

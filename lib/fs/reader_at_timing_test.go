@@ -2,7 +2,7 @@ package fs
 
 import (
 	"fmt"
-	"os"
+	"io/ioutil"
 	"testing"
 )
 
@@ -25,7 +25,7 @@ func benchmarkReaderAtMustReadAt(b *testing.B, isMmap bool) {
 	path := "BenchmarkReaderAtMustReadAt"
 	const fileSize = 8 * 1024 * 1024
 	data := make([]byte, fileSize)
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := ioutil.WriteFile(path, data, 0600); err != nil {
 		b.Fatalf("cannot create %q: %s", path, err)
 	}
 	defer MustRemoveAll(path)

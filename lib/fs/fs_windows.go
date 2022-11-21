@@ -120,15 +120,6 @@ type ioStatusBlock struct {
 	Status, Information uintptr
 }
 
-// UpdateFileHandle - changes file deletion semantic at windows to posix-like.
-func UpdateFileHandle(path string) error {
-	handle, err := windows.Open(path, windows.GENERIC_READ|windows.DELETE, windows.FILE_SHARE_READ|windows.FILE_SHARE_DELETE)
-	if err != nil {
-		return err
-	}
-	return setPosixDelete(handle)
-}
-
 // supported starting with Windows 10, version 1709.
 // supported by NTFS only.
 func setPosixDelete(handle windows.Handle) error {

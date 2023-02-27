@@ -15,6 +15,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bloomfilter"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/flagutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/leveledbytebufferpool"
@@ -243,27 +244,27 @@ type scrapeWork struct {
 	errsSuppressedCount int
 }
 
-//func (sw *scrapeWork) loadLastScrape() string {
-//	if len(sw.lastScrapeCompressed) > 0 {
-//		b, err := encoding.DecompressZSTD(sw.lastScrape[:0], sw.lastScrapeCompressed)
-//		if err != nil {
-//			logger.Panicf("BUG: cannot unpack compressed previous response: %s", err)
-//		}
-//		sw.lastScrape = b
-//	}
-//	return bytesutil.ToUnsafeString(sw.lastScrape)
-//}
+func (sw *scrapeWork) loadLastScrape() string {
+	if len(sw.lastScrapeCompressed) > 0 {
+		b, err := encoding.DecompressZSTD(sw.lastScrape[:0], sw.lastScrapeCompressed)
+		if err != nil {
+			logger.Panicf("BUG: cannot unpack compressed previous response: %s", err)
+		}
+		sw.lastScrape = b
+	}
+	return bytesutil.ToUnsafeString(sw.lastScrape)
+}
 
-//func (sw *scrapeWork) storeLastScrape(lastScrape []byte) {
-//	mustCompress := minResponseSizeForStreamParse.N > 0 && len(lastScrape) >= minResponseSizeForStreamParse.N
-//	if mustCompress {
-//		sw.lastScrapeCompressed = encoding.CompressZSTDLevel(sw.lastScrapeCompressed[:0], lastScrape, 1)
-//		sw.lastScrape = nil
-//	} else {
-//		sw.lastScrape = append(sw.lastScrape[:0], lastScrape...)
-//		sw.lastScrapeCompressed = nil
-//	}
-//}
+func (sw *scrapeWork) storeLastScrape(lastScrape []byte) {
+	mustCompress := minResponseSizeForStreamParse.N > 0 && len(lastScrape) >= minResponseSizeForStreamParse.N
+	if mustCompress {
+		sw.lastScrapeCompressed = encoding.CompressZSTDLevel(sw.lastScrapeCompressed[:0], lastScrape, 1)
+		sw.lastScrape = nil
+	} else {
+		sw.lastScrape = append(sw.lastScrape[:0], lastScrape...)
+		sw.lastScrapeCompressed = nil
+	}
+}
 
 func (sw *scrapeWork) finalizeLastScrape() {
 	if len(sw.lastScrapeCompressed) > 0 {
@@ -335,8 +336,8 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 		timestamp += scrapeInterval.Milliseconds()
 		select {
 		case <-stopCh:
-			//t := time.Now().UnixNano() / 1e6
-			//lastScrape := sw.loadLastScrape()
+			t := time.Now().UnixNano() / 1e6
+			lastScrape := sw.loadLastScrape()
 			select {
 			case <-globalStopCh:
 				// Do not send staleness markers on graceful shutdown as Prometheus does.
@@ -346,7 +347,7 @@ func (sw *scrapeWork) run(stopCh <-chan struct{}, globalStopCh <-chan struct{}) 
 				// when the given target disappears as Prometheus does.
 				// Use the current real timestamp for staleness markers, so queries
 				// stop returning data just after the time the target disappears.
-				//sw.sendStaleSeries(lastScrape, "", t, true)
+				sw.sendStaleSeries(lastScrape, "", t, true)
 			}
 			if sw.seriesLimiter != nil {
 				sw.seriesLimiter.MustStop()
@@ -442,9 +443,9 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 	scrapeResponseSize.Update(float64(len(body.B)))
 	up := 1
 	wc := writeRequestCtxPool.Get(sw.prevLabelsLen)
-	//lastScrape := sw.loadLastScrape()
+	lastScrape := sw.loadLastScrape()
 	bodyString := bytesutil.ToUnsafeString(body.B)
-	//areIdenticalSeries := sw.Config.NoStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
+	areIdenticalSeries := sw.Config.NoStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
 	if err != nil {
 		up = 0
 		scrapesFailed.Inc()
@@ -469,14 +470,14 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 		bodyString = ""
 	}
 	seriesAdded := 0
-	//if !areIdenticalSeries {
-	//	// The returned value for seriesAdded may be bigger than the real number of added series
-	//	// if some series were removed during relabeling.
-	//	// This is a trade-off between performance and accuracy.
-	//	seriesAdded = sw.getSeriesAdded(lastScrape, bodyString)
-	//}
+	if !areIdenticalSeries {
+		// The returned value for seriesAdded may be bigger than the real number of added series
+		// if some series were removed during relabeling.
+		// This is a trade-off between performance and accuracy.
+		seriesAdded = sw.getSeriesAdded(lastScrape, bodyString)
+	}
 	samplesDropped := 0
-	if sw.seriesLimitExceeded {
+	if sw.seriesLimitExceeded || !areIdenticalSeries {
 		samplesDropped = sw.applySeriesLimit(wc)
 		if samplesDropped > 0 {
 			sw.seriesLimitExceeded = true
@@ -502,12 +503,12 @@ func (sw *scrapeWork) scrapeInternal(scrapeTimestamp, realTimestamp int64) error
 		writeRequestCtxPool.Put(wc)
 	}
 	// body must be released only after wc is released, since wc refers to body.
-	//if !areIdenticalSeries {
-	//	// Send stale markers for disappeared metrics with the real scrape timestamp
-	//	// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
-	//	sw.sendStaleSeries(lastScrape, bodyString, realTimestamp, false)
-	//	sw.storeLastScrape(body.B)
-	//}
+	if !areIdenticalSeries {
+		// Send stale markers for disappeared metrics with the real scrape timestamp
+		// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
+		sw.sendStaleSeries(lastScrape, bodyString, realTimestamp, false)
+		sw.storeLastScrape(body.B)
+	}
 	sw.finalizeLastScrape()
 	if !mustSwitchToStreamParse {
 		// Return body to the pool only if its size is smaller than -promscrape.minResponseSizeForStreamParse
@@ -594,9 +595,9 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 		}
 		sr.MustClose()
 	}
-	//lastScrape := sw.loadLastScrape()
-	//bodyString := bytesutil.ToUnsafeString(sbr.body)
-	//areIdenticalSeries := sw.Config.NoStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
+	lastScrape := sw.loadLastScrape()
+	bodyString := bytesutil.ToUnsafeString(sbr.body)
+	areIdenticalSeries := sw.Config.NoStaleMarkers || parser.AreIdenticalSeriesFast(lastScrape, bodyString)
 
 	scrapedSamples.Update(float64(samplesScraped))
 	endTimestamp := time.Now().UnixNano() / 1e6
@@ -611,12 +612,12 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 		scrapesFailed.Inc()
 	}
 	seriesAdded := 0
-	//if !areIdenticalSeries {
-	//	// The returned value for seriesAdded may be bigger than the real number of added series
-	//	// if some series were removed during relabeling.
-	//	// This is a trade-off between performance and accuracy.
-	//	seriesAdded = sw.getSeriesAdded(lastScrape, bodyString)
-	//}
+	if !areIdenticalSeries {
+		// The returned value for seriesAdded may be bigger than the real number of added series
+		// if some series were removed during relabeling.
+		// This is a trade-off between performance and accuracy.
+		seriesAdded = sw.getSeriesAdded(lastScrape, bodyString)
+	}
 	am := &autoMetrics{
 		up:                    up,
 		scrapeDurationSeconds: duration,
@@ -630,12 +631,12 @@ func (sw *scrapeWork) scrapeStream(scrapeTimestamp, realTimestamp int64) error {
 	sw.prevBodyLen = sbr.bodyLen
 	wc.reset()
 	writeRequestCtxPool.Put(wc)
-	//if !areIdenticalSeries {
-	//	// Send stale markers for disappeared metrics with the real scrape timestamp
-	//	// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
-	//	sw.sendStaleSeries(lastScrape, bodyString, realTimestamp, false)
-	//	sw.storeLastScrape(sbr.body)
-	//}
+	if !areIdenticalSeries {
+		// Send stale markers for disappeared metrics with the real scrape timestamp
+		// in order to guarantee that query doesn't return data after this time for the disappeared metrics.
+		sw.sendStaleSeries(lastScrape, bodyString, realTimestamp, false)
+		sw.storeLastScrape(sbr.body)
+	}
 	sw.finalizeLastScrape()
 	tsmGlobal.Update(sw, up == 1, realTimestamp, int64(duration*1000), samplesScraped, err)
 	// Do not track active series in streaming mode, since this may need too big amounts of memory

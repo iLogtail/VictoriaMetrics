@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
@@ -26,18 +25,19 @@ import (
 	"github.com/VictoriaMetrics/metrics"
 )
 
+// Scraper is an ilogtail-facing Prometheus scrape instance.
 type Scraper struct {
 	globalStopCh         chan struct{}
 	scraperWG            sync.WaitGroup
 	configDetail         []byte
 	PendingScrapeConfigs int32
-	configData           atomic.Value
 
 	name              string
 	authorizationPath string
 	pushData          func(at *auth.Token, wr *prompbmarshal.WriteRequest)
 }
 
+// NewScraper creates a Scraper from Prometheus YAML bytes.
 func NewScraper(configDetail []byte, name, authorizationPath string) *Scraper {
 	return &Scraper{
 		configDetail:      configDetail,
@@ -46,6 +46,7 @@ func NewScraper(configDetail []byte, name, authorizationPath string) *Scraper {
 	}
 }
 
+// Init starts scrape loops and delivers samples via pushData.
 func (s *Scraper) Init(pushData func(at *auth.Token, wr *prompbmarshal.WriteRequest)) {
 	s.globalStopCh = make(chan struct{})
 	s.scraperWG.Add(1)
@@ -56,11 +57,13 @@ func (s *Scraper) Init(pushData func(at *auth.Token, wr *prompbmarshal.WriteRequ
 	}()
 }
 
+// Stop waits for scrape loops to exit.
 func (s *Scraper) Stop() {
 	close(s.globalStopCh)
 	s.scraperWG.Wait()
 }
 
+// CheckConfig parses the Prometheus YAML without starting scrapers.
 func (s *Scraper) CheckConfig() error {
 	_, err := loadContentConfig(s.configDetail, s.authorizationPath)
 	return err
@@ -124,6 +127,7 @@ func loadContentConfig(detail []byte, authorizationPath string) (*Config, error)
 	return &cfgObj, nil
 }
 
+// ConfigMemberInfo sets cluster scrape-member flags for this process.
 func ConfigMemberInfo(total int, number string) {
 	*clusterMemberNum = number
 	*clusterMembersCount = total

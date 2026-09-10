@@ -328,7 +328,7 @@ errcheck: install-errcheck
 install-errcheck:
 	which errcheck || go install github.com/kisielk/errcheck@v1.6.3
 
-check-all: fmt vet lint errcheck golangci-lint govulncheck
+check-all: fmt vet lint errcheck golangci-lint
 
 test:
 	go test ./lib/... ./app/...

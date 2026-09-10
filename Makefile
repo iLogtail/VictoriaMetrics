@@ -319,14 +319,14 @@ lint: install-golint
 	golint app/...
 
 install-golint:
-	which golint || go install golang.org/x/lint/golint@latest
+	which golint || go install golang.org/x/lint/golint@v0.0.0-20210508222113-6edffad5e616
 
 errcheck: install-errcheck
 	errcheck -exclude=errcheck_excludes.txt ./lib/...
 	errcheck -exclude=errcheck_excludes.txt ./app/...
 
 install-errcheck:
-	which errcheck || go install github.com/kisielk/errcheck@latest
+	which errcheck || go install github.com/kisielk/errcheck@v1.6.3
 
 check-all: fmt vet lint errcheck golangci-lint govulncheck
 
@@ -388,7 +388,7 @@ govulncheck: install-govulncheck
 	govulncheck ./...
 
 install-govulncheck:
-	which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@latest
+	which govulncheck || go install golang.org/x/vuln/cmd/govulncheck@v1.0.1
 
 install-wwhrd:
 	which wwhrd || go install github.com/frapposelli/wwhrd@latest

@@ -45,6 +45,27 @@ func getStdDialer() *net.Dialer {
 	return stdDialer
 }
 
+func statUnixDial(ctx context.Context, socketPath string) (net.Conn, error) {
+	d := getStdDialer()
+	conn, err := d.DialContext(ctx, "unix", socketPath)
+	dialsTotal.Inc()
+	if err != nil {
+		dialErrors.Inc()
+		return nil, err
+	}
+	conns.Inc()
+	sc := &statConn{
+		Conn: conn,
+	}
+	return sc, nil
+}
+
+func newStatUnixDialFunc(socketPath string) fasthttp.DialFunc {
+	return func(_ string) (net.Conn, error) {
+		return statUnixDial(context.Background(), socketPath)
+	}
+}
+
 var (
 	stdDialer     *net.Dialer
 	stdDialerOnce sync.Once

@@ -1248,11 +1248,20 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 	if len(metricsPath) == 0 {
 		metricsPath = "/metrics"
 	}
+	// The `__unix_socket__` label routes the scrape via the given unix socket
+	// instead of dialing `__address__`.
+	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
+	unixSocketPath := promrelabel.GetLabelValueByName(labels, "__unix_socket__")
 	address := promrelabel.GetLabelValueByName(labels, "__address__")
 	if len(address) == 0 {
-		// Drop target without scrape address.
-		droppedTargetsMap.Register(originalLabels)
-		return nil, nil
+		if len(unixSocketPath) == 0 {
+			// Drop target without scrape address.
+			droppedTargetsMap.Register(originalLabels)
+			return nil, nil
+		}
+		// Keep the scrape URL valid - the address is only used for the Host header,
+		// the scrape URL and the `instance` label, since the connection goes via the unix socket.
+		address = "localhost"
 	}
 	// Usability extension to Prometheus behavior: extract optional scheme and metricsPath from __address__.
 	// Prometheus silently drops targets with __address__ containing scheme or metricsPath
@@ -1268,7 +1277,9 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 		metricsPath = address[n:]
 		address = address[:n]
 	}
-	address = addMissingPort(address, scheme == "https")
+	if len(unixSocketPath) == 0 {
+		address = addMissingPort(address, scheme == "https")
+	}
 
 	var at *auth.Token
 	tenantID := promrelabel.GetLabelValueByName(labels, "__tenant_id__")
@@ -1354,6 +1365,7 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 
 	sw := &ScrapeWork{
 		ScrapeURL:            scrapeURL,
+		UnixSocketPath:       unixSocketPath,
 		ScrapeInterval:       scrapeInterval,
 		ScrapeTimeout:        scrapeTimeout,
 		HonorLabels:          swc.honorLabels,

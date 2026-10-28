@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -81,7 +82,8 @@ func newClient(sw *ScrapeWork) *client {
 	setProxyHeaders := func(req *http.Request) {}
 	setFasthttpProxyHeaders := func(req *fasthttp.Request) {}
 	proxyURL := sw.ProxyURL
-	if !isTLS && proxyURL.IsHTTPOrHTTPS() {
+	isUnixSocket := sw.UnixSocketPath != ""
+	if !isUnixSocket && !isTLS && proxyURL.IsHTTPOrHTTPS() {
 		// Send full sw.ScrapeURL in requests to a proxy host for non-TLS scrape targets
 		// like net/http package from Go does.
 		// See https://en.wikipedia.org/wiki/Proxy_server#Web_proxy_servers
@@ -101,11 +103,21 @@ func newClient(sw *ScrapeWork) *client {
 		}
 		proxyURL = &proxy.URL{}
 	}
-	hostPort = addMissingPort(hostPort, isTLS)
-	dialAddr = addMissingPort(dialAddr, isTLS)
-	dialFunc, err := newStatDialFunc(proxyURL, sw.ProxyAuthConfig)
-	if err != nil {
-		logger.Fatalf("cannot create dial func: %s", err)
+	var dialFunc fasthttp.DialFunc
+	stdDialContext := statStdDial
+	if isUnixSocket {
+		dialFunc = newStatUnixDialFunc(sw.UnixSocketPath)
+		stdDialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return statUnixDial(ctx, sw.UnixSocketPath)
+		}
+	} else {
+		hostPort = addMissingPort(hostPort, isTLS)
+		dialAddr = addMissingPort(dialAddr, isTLS)
+		var err error
+		dialFunc, err = newStatDialFunc(proxyURL, sw.ProxyAuthConfig)
+		if err != nil {
+			logger.Fatalf("cannot create dial func: %s", err)
+		}
 	}
 	hc := &fasthttp.HostClient{
 		Addr:                         dialAddr,
@@ -122,7 +134,7 @@ func newClient(sw *ScrapeWork) *client {
 	}
 	var sc *http.Client
 	var proxyURLFunc func(*http.Request) (*url.URL, error)
-	if pu := sw.ProxyURL.GetURL(); pu != nil {
+	if pu := sw.ProxyURL.GetURL(); pu != nil && !isUnixSocket {
 		proxyURLFunc = http.ProxyURL(pu)
 	}
 	sc = &http.Client{
@@ -133,7 +145,7 @@ func newClient(sw *ScrapeWork) *client {
 			IdleConnTimeout:        2 * sw.ScrapeInterval,
 			DisableCompression:     *disableCompression || sw.DisableCompression,
 			DisableKeepAlives:      *disableKeepAlive || sw.DisableKeepAlive,
-			DialContext:            statStdDial,
+			DialContext:            stdDialContext,
 			MaxIdleConnsPerHost:    100,
 			MaxResponseHeaderBytes: int64(maxResponseHeadersSize.N),
 

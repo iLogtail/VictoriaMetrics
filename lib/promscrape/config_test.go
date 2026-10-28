@@ -1603,3 +1603,95 @@ func TestScrapeConfigClone(t *testing.T) {
 		},
 	})
 }
+
+func TestGetStaticScrapeWorkUnixSocket(t *testing.T) {
+	f := func(data string, expectedSws []*ScrapeWork) {
+		t.Helper()
+		sws, err := getStaticScrapeWork([]byte(data), "non-existing-file")
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		resetNonEssentialFields(sws)
+		if !reflect.DeepEqual(sws, expectedSws) {
+			t.Fatalf("unexpected scrapeWork; got\n%+v\nwant\n%+v", sws, expectedSws)
+		}
+	}
+
+	// __unix_socket__ set via static_configs labels. No port is appended to __address__,
+	// since the connection goes via the socket.
+	f(`
+scrape_configs:
+- job_name: foo
+  static_configs:
+  - targets: ["node-sock"]
+    labels:
+      __unix_socket__: /run/node.sock
+`, []*ScrapeWork{
+		{
+			ScrapeURL:       "http://node-sock/metrics",
+			UnixSocketPath:  "/run/node.sock",
+			ScrapeInterval:  defaultScrapeInterval,
+			ScrapeTimeout:   defaultScrapeTimeout,
+			HonorTimestamps: true,
+			Labels: []prompbmarshal.Label{
+				{
+					Name:  "instance",
+					Value: "node-sock",
+				},
+				{
+					Name:  "job",
+					Value: "foo",
+				},
+			},
+			AuthConfig:      &promauth.Config{},
+			ProxyAuthConfig: &promauth.Config{},
+			jobNameOriginal: "foo",
+		},
+	})
+
+	// __address__ is dropped by relabeling, so it falls back to localhost instead of
+	// dropping the target.
+	f(`
+scrape_configs:
+- job_name: foo
+  relabel_configs:
+  - target_label: __address__
+    replacement: ""
+  - target_label: __unix_socket__
+    replacement: /run/node.sock
+  static_configs:
+  - targets: ["node-sock"]
+`, []*ScrapeWork{
+		{
+			ScrapeURL:       "http://localhost/metrics",
+			UnixSocketPath:  "/run/node.sock",
+			ScrapeInterval:  defaultScrapeInterval,
+			ScrapeTimeout:   defaultScrapeTimeout,
+			HonorTimestamps: true,
+			Labels: []prompbmarshal.Label{
+				{
+					Name:  "instance",
+					Value: "localhost",
+				},
+				{
+					Name:  "job",
+					Value: "foo",
+				},
+			},
+			AuthConfig:      &promauth.Config{},
+			ProxyAuthConfig: &promauth.Config{},
+			jobNameOriginal: "foo",
+		},
+	})
+
+	// Targets without both __address__ and __unix_socket__ are still dropped.
+	f(`
+scrape_configs:
+- job_name: foo
+  relabel_configs:
+  - target_label: __address__
+    replacement: ""
+  static_configs:
+  - targets: ["node-sock"]
+`, nil)
+}

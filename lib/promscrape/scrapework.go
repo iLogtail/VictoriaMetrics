@@ -47,6 +47,12 @@ type ScrapeWork struct {
 	// Full URL (including query args) for the scrape.
 	ScrapeURL string
 
+	// Optional path to the unix socket to connect to instead of the ScrapeURL host.
+	//
+	// It is set from the `__unix_socket__` label.
+	// See https://prometheus.io/docs/prometheus/latest/configuration/configuration/#scrape_config
+	UnixSocketPath string
+
 	// Interval for scraping the ScrapeURL.
 	ScrapeInterval time.Duration
 
@@ -148,11 +154,11 @@ func (sw *ScrapeWork) canSwitchToStreamParseMode() bool {
 func (sw *ScrapeWork) key() string {
 	// Do not take into account OriginalLabels, since they can be changed with relabeling.
 	// Take into account JobNameOriginal in order to capture the case when the original job_name is changed via relabeling.
-	key := fmt.Sprintf("JobNameOriginal=%s, ScrapeURL=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, "+
+	key := fmt.Sprintf("JobNameOriginal=%s, ScrapeURL=%s, UnixSocketPath=%s, ScrapeInterval=%s, ScrapeTimeout=%s, HonorLabels=%v, HonorTimestamps=%v, DenyRedirects=%v, Labels=%s, "+
 		"ExternalLabels=%s, "+
 		"ProxyURL=%s, ProxyAuthConfig=%s, AuthConfig=%s, MetricRelabelConfigs=%s, SampleLimit=%d, DisableCompression=%v, DisableKeepAlive=%v, StreamParse=%v, "+
 		"ScrapeAlignInterval=%s, ScrapeOffset=%s, SeriesLimit=%d, NoStaleMarkers=%v",
-		sw.jobNameOriginal, sw.ScrapeURL, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.DenyRedirects, sw.LabelsString(),
+		sw.jobNameOriginal, sw.ScrapeURL, sw.UnixSocketPath, sw.ScrapeInterval, sw.ScrapeTimeout, sw.HonorLabels, sw.HonorTimestamps, sw.DenyRedirects, sw.LabelsString(),
 		promLabelsString(sw.ExternalLabels),
 		sw.ProxyURL.String(), sw.ProxyAuthConfig.String(),
 		sw.AuthConfig.String(), sw.MetricRelabelConfigs.String(), sw.SampleLimit, sw.DisableCompression, sw.DisableKeepAlive, sw.StreamParse,

@@ -1649,21 +1649,18 @@ scrape_configs:
 		},
 	})
 
-	// __address__ is dropped by relabeling, so it falls back to localhost instead of
-	// dropping the target.
+	// __unix_socket__ set via relabeling.
 	f(`
 scrape_configs:
 - job_name: foo
   relabel_configs:
-  - target_label: __address__
-    replacement: ""
   - target_label: __unix_socket__
     replacement: /run/node.sock
   static_configs:
   - targets: ["node-sock"]
 `, []*ScrapeWork{
 		{
-			ScrapeURL:       "http://localhost/metrics",
+			ScrapeURL:       "http://node-sock/metrics",
 			UnixSocketPath:  "/run/node.sock",
 			ScrapeInterval:  defaultScrapeInterval,
 			ScrapeTimeout:   defaultScrapeTimeout,
@@ -1671,7 +1668,7 @@ scrape_configs:
 			Labels: []prompbmarshal.Label{
 				{
 					Name:  "instance",
-					Value: "localhost",
+					Value: "node-sock",
 				},
 				{
 					Name:  "job",
@@ -1684,7 +1681,8 @@ scrape_configs:
 		},
 	})
 
-	// Targets without both __address__ and __unix_socket__ are still dropped.
+	// __address__ stays mandatory for unix socket targets, like in Prometheus.
+	// See the `no address` check at scrape/target.go in prometheus/prometheus.
 	f(`
 scrape_configs:
 - job_name: foo
@@ -1693,5 +1691,7 @@ scrape_configs:
     replacement: ""
   static_configs:
   - targets: ["node-sock"]
+    labels:
+      __unix_socket__: /run/node.sock
 `, nil)
 }

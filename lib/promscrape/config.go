@@ -1254,14 +1254,9 @@ func (swc *scrapeWorkConfig) getScrapeWork(target string, extraLabels, metaLabel
 	unixSocketPath := promrelabel.GetLabelValueByName(labels, "__unix_socket__")
 	address := promrelabel.GetLabelValueByName(labels, "__address__")
 	if len(address) == 0 {
-		if len(unixSocketPath) == 0 {
-			// Drop target without scrape address.
-			droppedTargetsMap.Register(originalLabels)
-			return nil, nil
-		}
-		// Keep the scrape URL valid - the address is only used for the Host header,
-		// the scrape URL and the `instance` label, since the connection goes via the unix socket.
-		address = "localhost"
+		// Drop target without scrape address.
+		droppedTargetsMap.Register(originalLabels)
+		return nil, nil
 	}
 	// Usability extension to Prometheus behavior: extract optional scheme and metricsPath from __address__.
 	// Prometheus silently drops targets with __address__ containing scheme or metricsPath
